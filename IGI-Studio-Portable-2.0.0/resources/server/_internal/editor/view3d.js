@@ -1,0 +1,2638 @@
+/* The 3D close-up: the real geometry around one item, in
+ * WebGL, where the item can be moved by hand onto floors, desks and walls.
+ *
+ *   View3D.open(opts)   show the close-up; calling it again rebuilds it (a new
+ *                       target, a new radius) and keeps the view if opts.keepView
+ *   View3D.close()
+ *   View3D.isOpen()
+ *   View3D.follow(pose) the item changed outside the close-up (undo): follow it
+ *   View3D.update({target, objects, nav}) the plan changed outside it: bring the
+ *               scene up to date (same keys as open), keeping the view
+ *   opts.nav    walkways round it {nodes, links, route}; opts.onAddNode({x, y, z})
+ *               adds a walkway point where a floor is clicked
+ *
+ * opts (all positions in game metres, z up):
+ *   host        the element to cover (the map stage)
+ *   target      the item: {key, name, type, model, x, y, z, rot:[a,b,g], head:0|2,
+ *               lift, kind:"floor"|"wall"|"fixed", editable, cam, own, head model}
+ *   objects     everything within the radius, the same shape (target included)
+ *   terrain     {x0, y0, cell, w, h, z: Float32Array, shade: Float32Array|null}
+ *   mesh(model) -> {pos: Float32Array metres, idx: Uint16Array} | null
+ *   radius, inside (the item is in a building: start with the roof cut away)
+ *   level       the level whose archives hold the textures (api/model3d, api/texture);
+ *               without the studio server the models are drawn plain
+ *   onMove(key, pose)   pose {x, y, z, gamma, on}: the item was put down
+ *   onPick(key)         another item was clicked: edit that one instead
+ *   onRadius(r)         a new radius was asked for
+ *   onClose()
+ *   onPlace(pose)       with setPlacing() on: a click put a new item down here
+ *   onCancelPlace()     Esc while placing
+ *
+ *   View3D.setPlacing({label, model, kind, rot, head, lift} | null)
+ *                       an item from the inventory is in hand: a ghost of it
+ *                       follows the pointer, a click puts it down
+ *   opts.view   how to start: "orbit" (round the item), "top", "eye", "walk",
+ *               "player" (behind the player start, looking the way it faces)
+ *
+ * Driving it, as Unreal Engine's editor: one mode. The mouse is free when no
+ * button is held; a click selects (the ground or the sky: nothing). Left-drag
+ * looks round, right-drag circles the selected thing (or the middle of the
+ * view), middle-drag pans; while a button is held W A S D fly and Q E go down
+ * and up; the arrows fly any time; the wheel sets the speed. The selected
+ * thing moves only by its gizmo: W move, E rotate, Q none (R: the game has no
+ * scale). Esc lets go of the selection, again closes.
+ *
+ * Angles are the game's: alpha about x, then beta about y, then gamma about z
+ * (a rifle lying on a desk is (heading, 1.5708, 0) - its heading is alpha). The
+ * editor's "gamma" of an item is its heading, whichever angle carries it: the
+ * target's rot[head].
+ */
+import * as THREE from "three";
+
+const COL = {
+  building: 0xb8bcb0, prop: 0xa89574, solid: 0x76855c, vehicle: 0x76855c, door: 0x9aa3a8,
+  soldier: 0xb06a58, gun: 0x3c4044, player: 0x5fae6a, pickup: 0xd6c070, camera: 0x505a60, own: 0xe7c25a,
+  target: 0xffd24a, terrain: 0x8a9a6a, cone: 0xffe066
+};
+const WALL_OFF = 0.15;          // a wall item stands this far out, as on the map (camMount)
+const FLOOR_UP = 0.55;          // a surface is a floor if its normal is at least this upright
+const WALL_FLAT = 0.45;         // ... and a wall if it is at most this
+const STEP = Math.PI / 12;      // R turns 15 degrees
+
+let S = null;                   // the close-up, once built
+let O = null;                   // the current options
+
+function css() {
+  if (document.getElementById("v3d-css")) return;
+  const st = document.createElement("style");
+  st.id = "v3d-css";
+  st.textContent = `
+.v3d{position:absolute;inset:0;z-index:30;background:#0b1a10;display:flex;flex-direction:column}
+.v3d[hidden]{display:none}
+.v3d canvas{flex:1;min-height:0;width:100%;display:block;outline:none}
+.v3d-top{display:flex;align-items:center;flex-wrap:wrap;gap:6px 8px;padding:7px 10px;background:var(--surface);
+  border-bottom:1px solid var(--line);font-size:12px;color:var(--muted);white-space:nowrap;min-width:0}
+.v3d-name{display:flex;flex-direction:column;min-width:120px;flex:1 1 140px;line-height:1.25}
+.v3d-top b{color:var(--ink);font-size:13.5px;overflow:hidden;text-overflow:ellipsis}
+.v3d-sub{font-size:11px;overflow:hidden;text-overflow:ellipsis}
+.v3d-seg{display:flex;gap:2px;align-items:center;padding-left:6px;border-left:1px solid var(--line)}
+.v3d-seg .btn{padding:2px 7px;font-size:11.5px}
+.v3d-top label{display:flex;align-items:center;gap:5px;padding-left:6px;border-left:1px solid var(--line)}
+.v3d-top input[type=range]{width:90px;accent-color:var(--accent)}
+.v3d-cutv{min-width:44px;font:11px "IBM Plex Mono",monospace;color:var(--ink)}
+.v3d-read{position:absolute;left:12px;bottom:12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;
+  padding:7px 10px;font:12px "IBM Plex Mono",monospace;color:var(--ink);box-shadow:var(--shadow);max-width:60%;line-height:1.6}
+.v3d-read .k{color:var(--faint);margin-right:6px}
+.v3d-read .bad{color:var(--warn)}
+.v3d-help{position:absolute;right:12px;bottom:12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;
+  padding:7px 10px;font-size:11.5px;color:var(--muted);box-shadow:var(--shadow);max-width:360px;line-height:1.5}
+.v3d-help b{color:var(--ink);font-weight:600}
+.v3d-help-head{display:flex;align-items:center;gap:10px;margin-bottom:5px}
+.v3d-help-title{font:600 10.5px "IBM Plex Mono",monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+.v3d-help-fold{margin-left:auto;width:20px;height:18px;padding:0;border:1px solid var(--line);border-radius:3px;background:none;
+  color:var(--muted);font:14px/1 "IBM Plex Mono",monospace;cursor:pointer}
+.v3d-help-fold:hover,.v3d-help-fold:focus-visible{color:var(--accent);border-color:var(--accent);outline:none}
+.v3d-help-rows{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;align-items:baseline}
+.v3d-help-rows b{white-space:nowrap}
+.v3d-help.folded .v3d-help-rows{display:none}
+.v3d-help.folded .v3d-help-head{margin:0}
+.v3d .v3d-mini{position:absolute;right:12px;top:58px;width:200px;height:200px;flex:none;border:1px solid var(--line);border-radius:6px;
+  background:#07140a;box-shadow:var(--shadow);pointer-events:none}
+.v3d .v3d-mini[hidden]{display:none}
+.v3d-tip{position:absolute;pointer-events:none;background:rgba(4,18,8,.9);border:1px solid var(--line);border-radius:4px;
+  padding:3px 7px;font-size:11.5px;color:var(--ink);white-space:nowrap;transform:translate(12px,12px)}
+.v3d-tip[hidden]{display:none}
+.v3d-tip i{font-style:normal;color:var(--accent)}
+.v3d-none{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-size:14px}
+.v3d-range{min-width:150px}
+.v3d-range input{width:96px}
+.v3d-radv{min-width:38px;font:11px "IBM Plex Mono",monospace;color:var(--ink)}
+.v3d-cross{position:absolute;left:50%;top:calc(50% + 21px);width:22px;height:22px;margin:-11px 0 0 -11px;pointer-events:none;display:none}
+.v3d.looking .v3d-cross{display:block}
+.v3d-cross::before,.v3d-cross::after{content:"";position:absolute;background:rgba(141,255,154,.85);box-shadow:0 0 6px rgba(141,255,154,.7)}
+.v3d-cross::before{left:10px;top:0;width:2px;height:22px;clip-path:polygon(0 0,100% 0,100% 35%,0 35%,0 65%,100% 65%,100% 100%,0 100%)}
+.v3d-cross::after{top:10px;left:0;height:2px;width:22px;clip-path:polygon(0 0,35% 0,35% 100%,0 100%,0 0,65% 0,100% 0,100% 100%,65% 100%)}
+.v3d-hint{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);pointer-events:none;text-align:center;
+  padding:12px 20px;background:rgba(4,18,8,.84);border:1px solid var(--line);border-radius:4px;box-shadow:0 0 30px rgba(0,0,0,.5)}
+.v3d-hint[hidden]{display:none}
+.v3d-hint b{display:block;font:600 17px "Barlow Condensed",sans-serif;letter-spacing:.12em;text-transform:uppercase;color:var(--player)}
+.v3d-hint span{font-size:12px;color:var(--muted)}
+.v3d canvas{cursor:default}
+.v3d.looking canvas{cursor:none}
+.v3d-snapm.on,.v3d-snapr.on{border-color:var(--accent);color:var(--ink)}
+.v3d-speed{font:12px "IBM Plex Mono",monospace;color:var(--muted);padding:3px 8px;border:1px solid var(--line);border-radius:4px;transition:background .3s}
+.v3d-speed b{color:var(--ink)}
+.v3d-speed.flash{background:rgba(255,210,74,.25)}
+
+.v3d-load{position:absolute;left:50%;bottom:22px;width:min(420px,56%);transform:translateX(-50%);pointer-events:none}
+.v3d-load[hidden]{display:none}
+.v3d-load span{display:flex;justify-content:space-between;gap:12px;font:600 10px "IBM Plex Mono",monospace;
+  letter-spacing:.18em;color:#7fe08a;margin:0 0 4px 1px}
+.v3d-load em{font-style:normal;letter-spacing:.06em;color:var(--muted)}
+.v3d-load div{height:12px;border:1px solid #4fd062;background:rgba(3,18,6,.72);box-shadow:0 0 14px rgba(80,255,110,.22)}
+.v3d-load i{display:block;height:100%;width:0;background:linear-gradient(90deg,#1b8a31,#3ed85b);transition:width .25s ease}
+.v3d-film{position:absolute;left:0;right:0;bottom:0;pointer-events:none}
+.v3d-film[hidden]{display:none}
+.v3d-film .bar{position:absolute;left:0;right:0;background:#000}
+.v3d-film .bar.t{top:0}
+.v3d-film .bar.b{bottom:0}
+.v3d-film .fx{position:absolute;inset:0}
+.v3d-film .fx.line{background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px)}
+.v3d-film .fx.band,.v3d-film .fx.band_update{background:repeating-linear-gradient(0deg,rgba(0,0,0,.3) 0 1px,transparent 1px 3px),rgba(60,140,80,.18)}
+.v3d-film .fx.handicam{box-shadow:inset 0 0 120px rgba(0,0,0,.65)}
+.v3d-film .subt{position:absolute;left:8%;right:8%;bottom:4%;text-align:center;color:#f2f2e8;font-size:15px;line-height:1.4;
+  text-shadow:0 1px 2px #000,0 0 6px #000}
+.v3d-film .subt:empty{display:none}
+.v3d-film .ui{position:absolute;left:10px;right:10px;top:8px;display:flex;align-items:center;gap:8px;pointer-events:auto;
+  font:12px "IBM Plex Mono",monospace;color:#d8e8d8;padding:5px 8px;border-radius:5px;background:rgba(0,0,0,.55)}
+.v3d-film .ui .btn{padding:2px 9px;font-size:11.5px}
+.v3d-film .ui input[type=range]{flex:1;min-width:80px;accent-color:var(--accent)}
+.v3d-film .ui .ft{min-width:96px;text-align:right}
+.v3d-film .ui .fs{max-width:34%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fff}
+.v3d-film .note{position:absolute;left:10px;top:46px;font-size:11px;color:#c8d2c8;text-shadow:0 1px 2px #000;pointer-events:none}
+.v3d.filming .v3d-help,.v3d.filming .v3d-read,.v3d.filming .v3d-hint,.v3d.filming .v3d-cross{display:none!important}
+.v3d-film.bare .ui,.v3d-film.bare .note{display:none}`;
+  document.head.appendChild(st);
+}
+
+function build(host) {
+  css();
+  const el = document.createElement("div");
+  el.className = "v3d";
+  el.hidden = true;
+  el.innerHTML = `
+<div class="v3d-top">
+  <span class="v3d-name"><b class="v3d-title"></b><span class="v3d-sub"></span></span>
+  <label class="v3d-range" title="Range\nHow far round it to show, 10 to 60 m">Range
+    <input type="range" class="v3d-rad" min="10" max="60" step="10" value="60"><span class="v3d-radv">60 m</span></label>
+  <div class="v3d-seg" data-g="view">
+    <button class="btn" data-v="orbit" title="Look at it from around (F)">Around</button>
+    <button class="btn" data-v="top" title="From straight above (T)">Top</button>
+    <button class="btn" data-v="eye" title="Standing in front of it, 1.7 m eyes">Eye level</button>
+    <button class="btn" data-v="cam" title="What the camera sees">Camera view</button>
+    <button class="btn" data-v="walk" title="Walk at eye height: floors, stairs and the ground followed, walls in the way (G)">Walk</button></div>
+  <label title="Hide everything above this height: roofs, ceilings, the floors over a room">Cut
+    <input type="range" class="v3d-cut" min="0" max="100" value="100"><span class="v3d-cutv">off</span></label>
+  <label title="Other buildings see-through"><input type="checkbox" class="v3d-xray">X-ray</label>
+  <label title="Guard walkways: the navmesh's points and links, and the selected guard's patrol in gold"><input type="checkbox" class="v3d-nav">Walkways</label>
+  <div class="v3d-seg" data-g="giz" role="group" aria-label="Gizmo">
+    <button class="btn" data-v="move" title="Move (W)\nDrag an arrow along it, a square across its plane, the ball over floors and walls">Move</button>
+    <button class="btn" data-v="rotate" title="Rotate (E)\nDrag a ring to turn it about that axis. Soldiers, pickups and cameras turn only about up">Rotate</button></div>
+  <button class="btn v3d-snapm" title="Snap moves to half a metre">0.5 m</button>
+  <button class="btn v3d-snapr" title="Snap turns to 15 degrees">15°</button>
+  <span class="v3d-speed" title="The camera's speed (the wheel changes it)">Speed <b>5</b></span>
+  <button class="btn v3d-addnode" title="Add a walkway point: click a floor or the ground. It links to the walkway points on its floor within 15 m" hidden>Add walkway point</button>
+  <button class="btn v3d-test" title="Test from here\nBuild the mission with the player starting where you stand, facing where you look, and start the game" hidden>Test from here</button>
+  <label title="The game's own textures (off: plain colours - the level's grey-green, yours gold)"><input type="checkbox" class="v3d-tex" checked>Textures</label>
+  <button class="btn primary v3d-done" title="Esc">Done</button>
+</div>
+<canvas tabindex="0"></canvas>
+<canvas class="v3d-mini" hidden aria-hidden="true"></canvas>
+<div class="v3d-cross"></div>
+<div class="v3d-hint" hidden></div>
+<div class="v3d-read"></div>
+<div class="v3d-help"><div class="v3d-help-head"><span class="v3d-help-title">Keys</span>
+  <button class="v3d-help-fold" aria-expanded="true" title="Hide the keys">−</button></div><div class="v3d-help-rows"></div></div>
+<div class="v3d-tip" hidden></div>
+<div class="v3d-load" hidden aria-live="polite"><span><b>Loading</b><em></em></span><div><i></i></div></div>
+<div class="v3d-film" hidden><div class="fx"></div><div class="bar t"></div><div class="bar b"></div><div class="subt" aria-live="polite"></div>
+  <div class="ui"><button class="btn v3d-fplay" title="Play or pause (Space)">Pause</button>
+    <button class="btn v3d-fprev" title="The shot before (Left arrow)">&#9664;</button><button class="btn v3d-fnext" title="The next shot (Right arrow)">&#9654;</button>
+    <span class="fs"></span><input type="range" class="v3d-fseek" min="0" max="1000" value="0" aria-label="Time in the cutscene">
+    <span class="ft"></span><button class="btn primary v3d-fstop" title="Stop and look around from here (Esc)">Stop</button></div>
+  <div class="note"></div></div>`;
+  host.appendChild(el);
+  const canvas = el.querySelector("canvas");
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  } catch (e) {
+    el.insertAdjacentHTML("beforeend", '<div class="v3d-none">This browser cannot draw 3D here (WebGL is off).</div>');
+    return { el, dead: true };
+  }
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.localClippingEnabled = true;
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 3000);
+  camera.up.set(0, 0, 1);
+
+  const hemi = new THREE.HemisphereLight(0xe4eef5, 0x4a4f3c, 1.1);
+  hemi.position.set(0, 0, 1);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xfff2dc, 1.9);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.bias = -0.0004;
+  sun.shadow.normalBias = 0.02;
+  scene.add(sun);
+  scene.add(sun.target);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+
+  const s = {
+    el, canvas, renderer, scene, camera, sun, hemi, yaw: 0, pitch: -0.4, look: null,
+    root: new THREE.Group(), geo: new Map(), cut: new THREE.Plane(new THREE.Vector3(0, 0, -1), 1e6),
+    ray: new THREE.Raycaster(), items: [], byKey: new Map(), target: null, drag: null, down: null,
+    raf: 0, turn: 0, viewMode: "orbit", size: [0, 0], textured: true
+  };
+  try { s.textured = localStorage.getItem("plotter:v3dtex") !== "0"; } catch (e) { /* private window */ }
+  s.giz = gizBuild();
+  s.gizMode = "move"; s.speed = SPEED_START; s.snapMove = false; s.snapRot = true;
+  try {
+    const gm = localStorage.getItem("plotter:v3dgiz"); if (gm === "move" || gm === "rotate") s.gizMode = gm;
+    const sp = localStorage.getItem("plotter:v3dspeed2"); if (sp != null && isFinite(+sp)) s.speed = Math.max(0, Math.min(SPEEDS.length - 1, +sp));
+    s.snapMove = localStorage.getItem("plotter:v3dsnapm") === "1";
+    s.snapRot = localStorage.getItem("plotter:v3dsnapr") !== "0";
+  } catch (e) { /* private window */ }
+  el.querySelectorAll('[data-g="giz"] .btn').forEach(b => b.classList.toggle("on", b.dataset.v === s.gizMode));
+  el.querySelector(".v3d-snapm").classList.toggle("on", s.snapMove);
+  el.querySelector(".v3d-snapr").classList.toggle("on", s.snapRot);
+  el.querySelector(".v3d-speed").innerHTML = "Speed <b>" + (s.speed + 1) + "</b>";
+  el.querySelector(".v3d-tex").checked = s.textured;
+  scene.add(s.root);
+  el.querySelector(".v3d-done").addEventListener("click", close);
+  const rad = el.querySelector(".v3d-rad"), radv = el.querySelector(".v3d-radv");
+  rad.addEventListener("input", () => { radv.textContent = rad.value + " m"; });
+  rad.addEventListener("change", () => {
+    const r = +rad.value;
+    if (O && O.onRadius && r !== O.radius) O.onRadius(r);
+  });
+  el.querySelectorAll('[data-g="view"] .btn').forEach(b => b.addEventListener("click", () => setView(b.dataset.v)));
+  el.querySelector(".v3d-cut").addEventListener("input", e => setCut(+e.target.value));
+  el.querySelector(".v3d-xray").addEventListener("change", e => setXray(e.target.checked));
+  try { s.navOn = localStorage.getItem("plotter:v3dnav") === "1"; } catch (e) { /* private window */ }
+  el.querySelector(".v3d-nav").checked = !!s.navOn;
+  el.querySelector(".v3d-nav").addEventListener("change", e => {
+    S.navOn = e.target.checked;
+    try { localStorage.setItem("plotter:v3dnav", S.navOn ? "1" : "0"); } catch (err) { /* private window */ }
+    if (!S.navOn) setAddingNode(false);
+    makeNav();
+  });
+  // the keys box folds down to its title, and stays as it was left
+  const helpBox = el.querySelector(".v3d-help"), fold = el.querySelector(".v3d-help-fold");
+  const setFolded = f => {
+    helpBox.classList.toggle("folded", f);
+    fold.textContent = f ? "+" : "−";
+    fold.title = f ? "Show the keys" : "Hide the keys";
+    fold.setAttribute("aria-expanded", f ? "false" : "true");
+  };
+  try { setFolded(localStorage.getItem("plotter:v3dhelp") === "folded"); } catch (e) { /* private window */ }
+  fold.addEventListener("click", () => {
+    const f = !helpBox.classList.contains("folded");
+    setFolded(f);
+    try { localStorage.setItem("plotter:v3dhelp", f ? "folded" : "open"); } catch (err) { /* private window */ }
+  });
+  el.querySelectorAll('[data-g="giz"] .btn').forEach(b => b.addEventListener("click", () => setGizMode(b.dataset.v)));
+  el.querySelector(".v3d-snapm").addEventListener("click", e => {
+    S.snapMove = !S.snapMove; e.currentTarget.classList.toggle("on", S.snapMove);
+    try { localStorage.setItem("plotter:v3dsnapm", S.snapMove ? "1" : "0"); } catch (err) { /* private window */ }
+  });
+  el.querySelector(".v3d-snapr").addEventListener("click", e => {
+    S.snapRot = !S.snapRot; e.currentTarget.classList.toggle("on", S.snapRot);
+    try { localStorage.setItem("plotter:v3dsnapr", S.snapRot ? "1" : "0"); } catch (err) { /* private window */ }
+  });
+  el.querySelector(".v3d-addnode").addEventListener("click", () => setAddingNode(!S.addingNode));
+  el.querySelector(".v3d-test").addEventListener("click", () => {
+    const p = S.camera.position, o = O.origin;
+    if (O.onTest) O.onTest({ x: p.x + o[0], y: p.y + o[1], z: p.z - EYE + o[2], gamma: S.yaw });
+  });
+  el.querySelector(".v3d-tex").addEventListener("change", e => {
+    S.textured = e.target.checked;
+    try { localStorage.setItem("plotter:v3dtex", S.textured ? "1" : "0"); } catch (err) { /* private window */ }
+    if (O) { fill(); setXray(S.el.querySelector(".v3d-xray").checked); const h = S.placing; S.ghost = null; setPlacing(h); }
+  });
+  canvas.addEventListener("pointerdown", onDown, true);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointerleave", () => { tip(null); });
+  canvas.addEventListener("contextmenu", e => e.preventDefault());
+  canvas.addEventListener("wheel", onWheel, { passive: false });
+  window.addEventListener("keydown", onKey, true);
+  window.addEventListener("keyup", onKeyUp, true);
+  window.addEventListener("blur", () => { held.clear(); if (S) S.mouseHeld = false; });
+  document.addEventListener("pointerlockchange", onLockChange);
+  document.addEventListener("pointerlockerror", () => { if (S) hint(); });
+  return s;
+}
+
+// ------------------------------------------------------------------ geometry
+function geometryOf(model) {
+  if (S.geo.has(model)) return S.geo.get(model);
+  const m = O.mesh(model);
+  let g = null;
+  if (m && m.idx.length) {
+    g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(m.pos, 3));
+    g.setIndex(new THREE.BufferAttribute(m.idx, 1));
+    g.computeBoundingBox();
+    g.computeBoundingSphere();
+  }
+  S.geo.set(model, g);
+  return g;
+}
+
+// ------------------------------------------------------------------ textures
+// What is on its way - models and their pictures - for the bar at the foot of
+// the close-up. It shows only when loading takes a moment, and counts up to
+// everything asked for since it last had nothing to do.
+const LOADS = { on: 0, done: 0, timer: 0 };
+function loadOne(p) {
+  LOADS.on++;
+  loadBar();
+  return p.finally(() => { LOADS.on = Math.max(0, LOADS.on - 1); LOADS.done++; loadBar(); });
+}
+function loadBar() {
+  const bar = S && S.el && S.el.querySelector(".v3d-load");
+  if (!LOADS.on) {
+    clearTimeout(LOADS.timer); LOADS.timer = 0; LOADS.done = 0;
+    if (bar) bar.hidden = true;
+    return;
+  }
+  if (!bar) return;
+  if (bar.hidden) {
+    if (!LOADS.timer) LOADS.timer = setTimeout(() => { LOADS.timer = 0; if (LOADS.on) { bar.hidden = false; loadBar(); } }, 300);
+    return;
+  }
+  const total = LOADS.on + LOADS.done;
+  bar.querySelector("em").textContent = LOADS.done + " / " + total;
+  bar.querySelector("i").style.width = (LOADS.done / total * 100).toFixed(1) + "%";
+}
+function texUrl(name, lv) {
+  return "api/texture?name=" + encodeURIComponent(name) + "&level=" + lv + "&size=512";
+}
+const TMODEL = new Map();       // model -> Promise of {geo, groups} | null
+const TEX = new Map();          // texture name -> THREE.Texture
+function b64(s) {
+  const bin = atob(s), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+function texturedModel(model, level) {
+  const lv = level != null ? level : (O && O.level) || 0, key = model + "@" + lv;
+  if (TMODEL.has(key)) return TMODEL.get(key);
+  const p = loadOne(fetch("api/model3d?name=" + encodeURIComponent(model) + "&level=" + lv)
+    .then(r => r.ok ? r.json() : null).then(j => {
+      if (!j || !j.ok) return null;
+      const m = j.model, g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(b64(m.pos)), 3));
+      g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(b64(m.uv)), 2));
+      g.setIndex(new THREE.BufferAttribute(new Uint32Array(b64(m.idx)), 1));
+      m.groups.forEach((gr, i) => { if (!(gr[4] >= 0)) g.addGroup(gr[0], gr[1], i); });
+      g.computeBoundingBox();
+      g.computeBoundingSphere();
+      g.userData.keep = true;
+      // a part that turns (a helicopter's rotors): the same points, its own
+      // triangles, turned about its pivot while a cutscene plays
+      const spins = (m.spins || []).map((sp, k) => {
+        const sg = new THREE.BufferGeometry();
+        sg.setAttribute("position", g.getAttribute("position"));
+        sg.setAttribute("uv", g.getAttribute("uv"));
+        sg.setIndex(g.getIndex());
+        m.groups.forEach((gr, i) => { if (gr[4] === k) sg.addGroup(gr[0], gr[1], i); });
+        sg.boundingSphere = g.boundingSphere;
+        sg.userData.keep = true;
+        return { geo: sg, pivot: sp.pivot, axis: sp.axis, rate: sp.rate };
+      });
+      // the level it was read from: an imported model wears that level's pictures
+      return { geo: g, groups: m.groups, spins, home: m.home != null ? m.home : lv };
+    }).catch(() => null));
+  TMODEL.set(key, p);
+  return p;
+}
+function textureOf(name, level) {
+  const lv = level != null ? level : (O && O.level) || 0, key = name + "@" + lv;
+  if (TEX.has(key)) return TEX.get(key);
+  let arrived;
+  loadOne(new Promise(r => { arrived = r; }));
+  const t = new THREE.TextureLoader().load(texUrl(name, lv), () => arrived(), undefined, () => arrived());
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.flipY = false;                  // the game's uvs start at the top row
+  t.anisotropy = 4;
+  TEX.set(key, t);
+  return t;
+}
+// Everything a level's close-up draws, fetched before it is asked for, so the
+// 3D view opens whole: each model (kept, as the close-up keeps them), then the
+// pictures they are drawn with (into the browser's cache, for the close-up to
+// find there). onProgress(stage, done, total) as it goes: "models", then
+// "pictures", then "ready". A newer call stops an older one.
+let PREP = 0;
+async function prepare(level, models, onProgress) {
+  const mine = ++PREP, lv = level || 0;
+  const list = [...new Set(models)].filter(Boolean), pics = [], seen = new Set();
+  const say = (stage, done, total) => { if (mine === PREP && onProgress) onProgress(stage, done, total); };
+  async function each(items, stage, work) {
+    let next = 0, done = 0;
+    say(stage, 0, items.length);
+    await Promise.all(Array.from({ length: 6 }, async () => {
+      while (next < items.length && mine === PREP) {
+        await work(items[next++]);
+        say(stage, ++done, items.length);
+      }
+    }));
+  }
+  await each(list, "models", async m => {
+    const t = await texturedModel(m, lv);
+    if (t) for (const g of t.groups) {
+      const k = g[2] + "@" + t.home;
+      if (g[2] && !seen.has(k)) { seen.add(k); pics.push([g[2], t.home]); }
+    }
+  });
+  if (mine !== PREP) return;
+  await each(pics, "pictures", p => fetch(texUrl(p[0], p[1])).then(r => r.blob()).catch(() => null));
+  say("ready", list.length + pics.length, list.length + pics.length);
+}
+
+// one of a model's surfaces: its texture cut out where it has holes (a fence,
+// leaves), blended where it is see-through all over (glass, a rotor's blades)
+function surface(gr, home, tint) {
+  const soft = gr[3] === "soft";
+  return new THREE.MeshLambertMaterial({ color: tint, side: THREE.DoubleSide, flatShading: true,
+    map: gr[2] ? textureOf(gr[2], home) : null, alphaTest: soft ? 0.01 : gr[3] ? 0.5 : 0,
+    transparent: soft, depthWrite: !soft });
+}
+// the model's own look, once it has come: its textures, tinted for what it is
+function dress(mesh, it, isTarget) {
+  if (!S.textured || !it.model || !O.level) return;
+  const wanted = S.fillId;
+  texturedModel(it.model).then(t => {
+    if (!t || wanted !== S.fillId || !mesh.parent) return;
+    const tint = isTarget ? 0xffe9a0 : it.own ? 0xfff2c8 : 0xffffff;
+    const mats = t.groups.map(gr => {
+      const m = surface(gr, t.home, tint);
+      if (isTarget) m.emissive = new THREE.Color(0x2a1c00);
+      else m.clippingPlanes = cutFor(it);
+      return m;
+    });
+    const old = mesh.material;
+    mesh.geometry = t.geo;
+    mesh.material = mats;
+    (Array.isArray(old) ? old : [old]).forEach(m => m.dispose());
+    for (const c of mesh.children.filter(c => c.userData.spin)) mesh.remove(c);
+    for (const sp of t.spins || []) {
+      // hung at its pivot, its points drawn back from there, turned about its axis
+      const pv = new THREE.Group(), sm = new THREE.Mesh(sp.geo, mats);
+      pv.position.set(sp.pivot[0], sp.pivot[1], sp.pivot[2]);
+      sm.position.set(-sp.pivot[0], -sp.pivot[1], -sp.pivot[2]);
+      sm.userData.item = it;
+      pv.add(sm);
+      pv.userData.spin = { axis: new THREE.Vector3(sp.axis[0], sp.axis[1], sp.axis[2]).normalize(), rate: sp.rate, item: it };
+      mesh.add(pv);
+      (S.spinning || (S.spinning = [])).push(pv);
+    }
+    if (S.el.querySelector(".v3d-xray").checked && it.type === "building" && !isTarget) setXray(true);
+  });
+}
+
+function material(color, opts = {}) {
+  return new THREE.MeshLambertMaterial(Object.assign({
+    color, flatShading: true, side: THREE.DoubleSide
+  }, opts));
+}
+
+// which of the three angles carries an item's heading: alpha (0) for a rifle
+// lying down, gamma (2) for everything else; and how: angle = off + sign *
+// heading (a rifle's alpha turns it clockwise, so its sign is -1)
+function hi(it) { return it && it.head === 0 ? 0 : 2; }
+function sgn(it) { return it && it.headSign === -1 ? -1 : 1; }
+function headOf(it, rot) { return sgn(it) * (((rot || [])[hi(it)] || 0) - (it.headOff || 0)); }
+
+// the game's orientation: alpha about x, then beta about y, then gamma about z
+function orient(obj, rot) {
+  obj.rotation.set(rot[0] || 0, rot[1] || 0, rot[2] || 0, "ZYX");
+}
+
+function colorOf(it) {
+  if (it.key === O.target.key && !S.noSel) return COL.target;
+  if (it.own) return COL.own;
+  if (it.type === "building") return COL.building;
+  if (it.type === "soldier") return COL.soldier;
+  if (it.type === "player") return COL.player;
+  if (it.type === "pickup") return COL.pickup;
+  if (it.type === "camera") return COL.camera;
+  if (it.type === "door") return COL.door;
+  if (it.type === "vehicle" || it.type === "explodable" || it.solid) return COL.solid;
+  return COL.prop;
+}
+
+function makeItem(it) {
+  const group = new THREE.Group();
+  if (it.type === "spot") {               // a place, not a thing: nothing to draw
+    group.userData.item = it;
+    group.userData.body = new THREE.Group();
+    group.add(group.userData.body);
+    place(group, it);
+    return group;
+  }
+  const isTarget = it.key === O.target.key && !S.noSel;     // the selected look
+  const mat = material(colorOf(it), isTarget ? { emissive: 0x3a2a00 } : {});
+  if (!isTarget && it.type !== "terrain") mat.clippingPlanes = cutFor(it);
+  const g = it.model ? geometryOf(it.model) : null;
+  const body = new THREE.Group();
+  body.position.z = it.lift || 0;
+  if (g) {
+    const mesh = new THREE.Mesh(g, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData.item = it;
+    body.add(mesh);
+    dress(mesh, it, isTarget);
+    if (isTarget && g.index.count < 60000) {
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(g, 35),
+        new THREE.LineBasicMaterial({ color: 0xfff0a0, transparent: true, opacity: 0.85 }));
+      body.add(edges);
+    }
+  } else {
+    // nothing to draw it with: a marker the size of a person
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 1.0), mat);
+    mesh.position.z = 0.5;
+    mesh.userData.item = it;
+    body.add(mesh);
+  }
+  if (g && it.gun && it.grip) body.add(gunOf(it, isTarget));
+  if (it.cam && it.cam.model) {
+    // the camera itself, on its holder: pan about z, tilt about x
+    const hg = geometryOf(it.cam.model);
+    if (hg) {
+      const head = new THREE.Mesh(hg, mat.clone());
+      head.rotation.set(it.cam.pitch || 0, 0, it.cam.pan || 0, "ZYX");
+      head.castShadow = true;
+      head.userData.item = it;
+      body.add(head);
+      dress(head, Object.assign({}, it, { model: it.cam.model }), isTarget);
+      if (isTarget || it.cam.cone) body.add(viewCone(it.cam));
+    }
+  }
+  group.add(body);
+  group.userData.item = it;
+  group.userData.body = body;
+  place(group, it);
+  return group;
+}
+
+// the weapon in a guard's hands: its model on the grip his pose holds it at
+// (meshes.json "grips": position, then the rotation row by row)
+function gunOf(it, isTarget, ghostMat) {
+  const gg = geometryOf(it.gun);
+  if (!gg) return new THREE.Group();
+  const q = it.grip, mat = ghostMat || material(COL.gun, isTarget ? { emissive: 0x2a1c00 } : {});
+  if (!ghostMat && !isTarget) mat.clippingPlanes = cutFor(it);
+  const gun = new THREE.Mesh(gg, mat);
+  gun.matrixAutoUpdate = false;
+  gun.matrix.set(q[3], q[4], q[5], q[0], q[6], q[7], q[8], q[1], q[9], q[10], q[11], q[2], 0, 0, 0, 1);
+  gun.castShadow = true;
+  if (ghostMat) gun.raycast = () => {};
+  else {
+    gun.userData.item = it;
+    dress(gun, Object.assign({}, it, { model: it.gun }), isTarget);
+  }
+  return gun;
+}
+
+// what a camera sees: a pyramid of its field of view out to its range
+function viewCone(cam) {
+  const r = Math.min(cam.range || 20, 60), h = Math.tan(((cam.fov || 50) * Math.PI / 180) / 2) * r,
+    v = Math.tan(((cam.fovV || 40) * Math.PI / 180) / 2) * r;
+  const p = [0, 0, 0, -h, r, -v, h, r, -v, h, r, v, -h, r, v];
+  const idx = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+  g.setIndex(idx);
+  const cone = new THREE.Group();
+  cone.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: COL.cone, transparent: true, opacity: 0.12,
+    side: THREE.DoubleSide, depthWrite: false })));
+  cone.add(new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: COL.cone,
+    transparent: true, opacity: 0.55 })));
+  cone.rotation.set(cam.pitch || 0, 0, cam.pan || 0, "ZYX");
+  cone.raycast = () => {};
+  cone.traverse(c => { c.raycast = () => {}; });
+  return cone;
+}
+
+function place(group, it) {
+  const o = O.origin;
+  group.position.set(it.x - o[0], it.y - o[1], it.z - o[2]);
+  orient(group, it.rot || [0, 0, it.gamma || 0]);
+  group.userData.box = null;                   // where it stands, for walking, is asked again
+}
+
+// Roads and the railway in the close-up: each stretch of a level's splines
+// (see the map's drawSplines) laid as a ribbon that follows the ground, with
+// rails on top of a railway. Fences and wires come as thin lines.
+const SPL_COL = { rail: 0x4a4438, road: 0x3c4038, line: 0xb9b5a0 };
+function ribbon(pts, width, lift) {
+  const o = O.origin, half = width / 2, pos = [], idx = [];
+  let run = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[Math.max(0, i - 1)], r = pts[Math.min(pts.length - 1, i + 1)];
+    let dx = r[0] - q[0], dy = r[1] - q[1];
+    const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+    const x = p[0] - o[0], y = p[1] - o[1], g = groundAt(x, y), w = p[2] != null ? p[2] - o[2] : null;
+    const z = g === null ? w : w === null ? g : Math.max(g, w);   // over a gap (a bridge) the waypoints hold it up
+    if (z === null) { run = 0; continue; }
+    pos.push(x - dy * half, y + dx * half, z + lift, x + dy * half, y - dx * half, z + lift);
+    run++;
+    if (run >= 2) { const n = pos.length / 3 - 4; idx.push(n, n + 1, n + 2, n + 1, n + 3, n + 2); }
+  }
+  if (idx.length < 3) return null;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+// A stretch as the game lays it: its own model, which runs along +x from its
+// start, fitted from one waypoint to the next and bent along the curve - its
+// width across the way, its height up from it (an embankment hangs below the
+// rails it carries). Trainyard's embankment waypoints stand 130 m apart, the
+// length of the model itself; elsewhere the model is stretched to the stretch.
+// The curve is the map's own in plan (Catmull-Rom through four waypoints); the
+// height runs straight from one waypoint to the next. Smoothed like the plan, it
+// sagged: Trainyard's track by the player's start dipped 1.4 m into level
+// ground before the waypoint where the embankment begins, 19 m higher.
+function curveAt(c, t, out) {
+  const p0 = c.ctrl[0], p1 = c.ctrl[1], p2 = c.ctrl[2], p3 = c.ctrl[3], t2 = t * t, t3 = t2 * t;
+  for (let k = 0; k < 2; k++)
+    out[k] = c.linear ? p1[k] + (p2[k] - p1[k]) * t
+      : 0.5 * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
+        + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3);
+  out[2] = p1[2] + (p2[2] - p1[2]) * t;
+  return out;
+}
+function bentAlong(geo, c) {
+  const src = geo.getAttribute("position"), bb = geo.boundingBox, o = O.origin;
+  const x0 = bb.min.x, span = Math.max(0.01, bb.max.x - bb.min.x);
+  const pos = new Float32Array(src.count * 3), at = [0, 0, 0], a = [0, 0, 0], b = [0, 0, 0];
+  for (let i = 0; i < src.count; i++) {
+    const t = Math.min(1, Math.max(0, (src.getX(i) - x0) / span));
+    curveAt(c, t, at);
+    curveAt(c, Math.max(0, t - 0.02), a);
+    curveAt(c, Math.min(1, t + 0.02), b);
+    let dx = b[0] - a[0], dy = b[1] - a[1];
+    const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+    const y = src.getY(i);                                  // the model's +y is left of the way it runs
+    pos[i * 3] = at[0] - dy * y - o[0];
+    pos[i * 3 + 1] = at[1] + dx * y - o[1];
+    pos[i * 3 + 2] = at[2] + src.getZ(i) - o[2];
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("uv", geo.getAttribute("uv").clone());
+  g.setIndex(geo.getIndex().clone());
+  for (const gr of geo.groups) g.addGroup(gr.start, gr.count, gr.materialIndex);
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
+}
+function splineMeshes(list) {
+  S.splineKeys = list.map(t => t.key).sort().join("|");
+  const group = new THREE.Group();
+  const mats = {}, fillId = S.fillId;
+  for (const s of list) {
+    const kind = s.kind || "road", w = Math.max(0.15, s.width || 4);
+    const g = ribbon(s.pts, kind === "line" ? 0.25 : w, 0.06);
+    if (!g) continue;
+    mats[kind] = mats[kind] || material(SPL_COL[kind], { polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+    const strip = [new THREE.Mesh(g, mats[kind])];          // shown until the stretch's own model comes
+    group.add(strip[0]);
+    if (kind === "rail") {                                  // two rails, standard gauge
+      mats.steel = mats.steel || material(0xa9a49a, { polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
+      for (const off of [-0.72, 0.72]) {
+        const side = s.pts.map((p, i) => {
+          const q = s.pts[Math.max(0, i - 1)], r = s.pts[Math.min(s.pts.length - 1, i + 1)];
+          let dx = r[0] - q[0], dy = r[1] - q[1];
+          const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+          return [p[0] - dy * off, p[1] + dx * off, p[2]];
+        });
+        const rg = ribbon(side, 0.16, 0.16);
+        if (rg) { const m = new THREE.Mesh(rg, mats.steel); strip.push(m); group.add(m); }
+      }
+    }
+    if (!s.model || !s.ctrl || !S.textured || !O.level) continue;
+    texturedModel(s.model).then(t => {
+      if (!t || fillId !== S.fillId || !group.parent) return;
+      const ms = t.groups.map(gr => surface(gr, t.home, 0xffffff));
+      group.add(new THREE.Mesh(bentAlong(t.geo, s), ms));
+      for (const m of strip) m.visible = false;
+    });
+  }
+  return group;
+}
+function terrainMesh(t) {
+  const o = O.origin, w = t.w, h = t.h;
+  const pos = new Float32Array(w * h * 3), col = new Float32Array(w * h * 3), uv = new Float32Array(w * h * 2);
+  const base = new THREE.Color(COL.terrain), rock = new THREE.Color(0x8f8b80), c = new THREE.Color();
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+    const k = j * w + i;
+    let z = t.z[k];
+    if (!(z === z)) z = o[2] - 50;
+    pos[k * 3] = t.x0 + i * t.cell - o[0];
+    pos[k * 3 + 1] = t.y0 + j * t.cell - o[1];
+    pos[k * 3 + 2] = z - o[2];
+    // the detail texture repeats every 4 m, fixed to the world
+    uv[k * 2] = (t.x0 + i * t.cell) / 4;
+    uv[k * 2 + 1] = (t.y0 + j * t.cell) / 4;
+  }
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+    const k = j * w + i;
+    const zx = pos[(j * w + Math.min(w - 1, i + 1)) * 3 + 2] - pos[(j * w + Math.max(0, i - 1)) * 3 + 2];
+    const zy = pos[(Math.min(h - 1, j + 1) * w + i) * 3 + 2] - pos[(Math.max(0, j - 1) * w + i) * 3 + 2];
+    const slope = Math.min(1, Math.hypot(zx, zy) / (4 * t.cell));
+    if (t.rgb) {
+      // the ground's own material, a little greyer where it is steep
+      c.setRGB(t.rgb[k * 3], t.rgb[k * 3 + 1], t.rgb[k * 3 + 2], THREE.SRGBColorSpace).lerp(rock, slope * 0.35);
+      if (t.tile) c.multiplyScalar(1 / Math.max(0.25, t.tile.mean * 1.6));   // the detail map darkens by its mean
+    } else {
+      c.copy(base).lerp(rock, slope);
+      const sh = t.shade ? t.shade[k] : 0.5;
+      c.multiplyScalar(0.75 + 0.5 * sh);
+    }
+    col[k * 3] = c.r; col[k * 3 + 1] = c.g; col[k * 3 + 2] = c.b;
+  }
+  // where a building is open to the sky under ground level (a ramp down to
+  // bunker doors) the game draws no ground: those points are left out
+  const idx = [], hole = t.hole;
+  for (let j = 0; j < h - 1; j++) for (let i = 0; i < w - 1; i++) {
+    const a = j * w + i, b = a + 1, cc = a + w, d = cc + 1;
+    if (hole && (hole[a] || hole[b] || hole[cc] || hole[d])) continue;
+    idx.push(a, b, d, a, d, cc);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  if (S.textured && t.mat && t.tex) {
+    const mesh = new THREE.Mesh(g, groundMaterial(t, g, pos));
+    mesh.receiveShadow = true;
+    mesh.userData.item = { key: "terrain", name: "the ground", type: "terrain" };
+    return mesh;
+  }
+  let map = null;
+  if (t.tile && t.rgb) {
+    // the level's own grain: its most common ground texture, in grey
+    const src = t.tile.px, n = t.tile.size, px = new Uint8Array(n * n * 4);
+    for (let q = 0; q < n * n; q++) {
+      const v = src[q];
+      px[q * 4] = px[q * 4 + 1] = px[q * 4 + 2] = v;
+      px[q * 4 + 3] = 255;
+    }
+    map = new THREE.DataTexture(px, n, n, THREE.RGBAFormat);
+    map.wrapS = map.wrapT = THREE.RepeatWrapping;
+    map.magFilter = THREE.LinearFilter;
+    map.minFilter = THREE.LinearMipmapLinearFilter;
+    map.generateMipmaps = true;
+    map.needsUpdate = true;
+  }
+  const mesh = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, map }));
+  mesh.receiveShadow = true;
+  mesh.userData.item = { key: "terrain", name: "the ground", type: "terrain" };
+  return mesh;
+}
+
+// The ground as the game textures it: each point's own material, its texture
+// laid fixed to the world, one material easing into the next between points.
+// Up to eight materials, most of the ground first; each point's material is a
+// weight on its own layer (gw0 for layers 0-3, gw1 for 4-7), so across a
+// triangle the textures blend. Lit, shadowed and fogged as the rest (Lambert).
+const GROUND_M = 8;                 // metres of ground one texture covers
+function groundMaterial(t, g, pos) {
+  const tex = t.tex, n = Math.min(8, tex.order.length), size = tex.size, o = O.origin;
+  const layer = new Map(tex.order.slice(0, n).map((m, i) => [m, i]));
+  const cnt = t.w * t.h, w0 = new Float32Array(cnt * 4), w1 = new Float32Array(cnt * 4), guv = new Float32Array(cnt * 2);
+  // texture coordinates from a corner on the texture's own grid near the origin, so
+  // they stay small (precise) and the texture stays put however the view is opened
+  const ox = Math.floor(o[0] / GROUND_M) * GROUND_M, oy = Math.floor(o[1] / GROUND_M) * GROUND_M;
+  for (let k = 0; k < cnt; k++) {
+    const l = layer.has(t.mat[k]) ? layer.get(t.mat[k]) : 0;
+    (l < 4 ? w0 : w1)[k * 4 + (l & 3)] = 1;
+    guv[k * 2] = (pos[k * 3] + o[0] - ox) / GROUND_M;
+    guv[k * 2 + 1] = (pos[k * 3 + 1] + o[1] - oy) / GROUND_M;
+  }
+  g.setAttribute("gw0", new THREE.BufferAttribute(w0, 4));
+  g.setAttribute("gw1", new THREE.BufferAttribute(w1, 4));
+  g.setAttribute("guv", new THREE.BufferAttribute(guv, 2));
+  // the textures as layers of one array texture, R G B A
+  const data = new Uint8Array(size * size * 4 * n);
+  for (let i = 0; i < n; i++) {
+    const src = tex.px[i], base = i * size * size * 4;
+    for (let q = 0; q < size * size; q++) {
+      data[base + q * 4] = src[q * 3];
+      data[base + q * 4 + 1] = src[q * 3 + 1];
+      data[base + q * 4 + 2] = src[q * 3 + 2];
+      data[base + q * 4 + 3] = 255;
+    }
+  }
+  const arr = new THREE.DataArrayTexture(data, size, size, n);
+  arr.format = THREE.RGBAFormat;
+  arr.colorSpace = THREE.SRGBColorSpace;
+  arr.wrapS = arr.wrapT = THREE.RepeatWrapping;
+  arr.magFilter = THREE.LinearFilter;
+  arr.minFilter = THREE.LinearMipmapLinearFilter;
+  arr.generateMipmaps = true;
+  arr.anisotropy = S.renderer.capabilities.getMaxAnisotropy();
+  arr.needsUpdate = true;
+  const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  mat.userData.gTex = arr;
+  mat.customProgramCacheKey = () => "igi-ground-" + n;
+  mat.onBeforeCompile = sh => {
+    sh.uniforms.gTex = { value: arr };
+    sh.vertexShader = sh.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute vec4 gw0;\nattribute vec4 gw1;\nattribute vec2 guv;\n" +
+        "varying vec4 vGw0;\nvarying vec4 vGw1;\nvarying vec2 vGuv;")
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\nvGw0 = gw0;\nvGw1 = gw1;\nvGuv = guv;");
+    let sum = "";
+    for (let i = 0; i < n; i++) {
+      sum += "gSum += texture(gTex, vec3(vGuv, " + i + ".0)).rgb * " + (i < 4 ? "vGw0" : "vGw1") + "." + "xyzw"[i & 3] + ";\n";
+    }
+    sh.fragmentShader = sh.fragmentShader
+      .replace("#include <common>", "#include <common>\nprecision highp sampler2DArray;\nuniform sampler2DArray gTex;\n" +
+        "varying vec4 vGw0;\nvarying vec4 vGw1;\nvarying vec2 vGuv;")
+      .replace("#include <color_fragment>", "#include <color_fragment>\nvec3 gSum = vec3(0.0);\n" + sum +
+        "diffuseColor.rgb *= gSum / max(dot(vGw0, vec4(1.0)) + dot(vGw1, vec4(1.0)), 1e-4);");
+  };
+  return mat;
+}
+
+// ------------------------------------------------------------------ building the scene
+function drop(obj) {
+  const cached = new Set(S.geo.values());
+  obj.traverse(c => {
+    if (c.userData.item && c.userData.item.type === "terrain" && c.material && c.material.userData.gTex) c.material.userData.gTex.dispose();
+    if (c.userData.item && c.userData.item.type === "terrain" && c.material && c.material.map) c.material.map.dispose();
+    if (c.geometry && !cached.has(c.geometry) && !c.geometry.userData.keep) c.geometry.dispose();
+    if (c.material) (Array.isArray(c.material) ? c.material : [c.material]).forEach(m => m.dispose());
+  });
+}
+function fill() {
+  const root = S.root;
+  S.fillId = (S.fillId || 0) + 1;         // textures on their way to an older scene are dropped
+  drop(root);
+  root.clear();
+  S.spinning = [];
+  S.items = [];
+  S.byKey = new Map();
+  if (O.terrain) root.add(terrainMesh(O.terrain));
+  S.splines = O.splines && O.splines.length ? splineMeshes(O.splines) : null;
+  if (S.splines) root.add(S.splines);
+  for (const it of O.objects) {
+    const g = makeItem(it);
+    root.add(g);
+    S.items.push(g);
+    S.byKey.set(it.key, g);
+  }
+  S.target = S.byKey.get(O.target.key) || null;
+  S.turn = 0;
+  S.nav = null;
+  makeNav();
+  const R = O.radius + 6;
+  sunOver(0, 0, 0);
+  const sc = S.sun.shadow.camera;
+  sc.left = -R * 1.3; sc.right = R * 1.3; sc.top = R * 1.3; sc.bottom = -R * 1.3;
+  sc.near = 0.5; sc.far = R * 8;
+  sc.updateProjectionMatrix();
+  S.scene.fog = new THREE.Fog(0x9fb2ba, 1, 2);
+  fogFor();
+  S.scene.background = new THREE.Color(0x9fb2ba);
+}
+// the ground reaches further than the things on it; the fog ends where it
+// does - and a cutscene's camera high over it sees that much further down
+function fogFor() {
+  if (!S || !S.scene.fog) return;
+  const T = O.terrain, R = O.radius + 6, reach = T ? Math.min(T.w, T.h) * T.cell / 2 : R * 3;
+  let up = 0;
+  if (S.film) {
+    const p = S.camera.position, g = groundAt(p.x, p.y);
+    up = Math.max(0, p.z - (g == null ? p.z : g));
+  }
+  S.scene.fog.near = Math.max(R, reach * 0.45) + up * 0.8;
+  S.scene.fog.far = reach * 0.97 + up;
+}
+
+// the sun: from the north-west, high, its shadows over the close-up round a
+// point (the item, or wherever the camera has gone)
+function sunOver(x, y, z) {
+  const R = O.radius + 6;
+  S.sun.position.set(x - 0.55 * R * 2, y + 0.75 * R * 2, z + 1.6 * R * 2);
+  S.sun.target.position.set(x, y, z);
+}
+
+// The close-up goes where the camera goes. Once the camera is a few metres from
+// where the scene was gathered, the host gathers it again round the camera:
+// what stands near, the walkways and, once the camera nears the edge of the
+// ground it has, the ground. What is still near stays as it is, what came into
+// reach is made and what fell out of it goes, so you can fly or walk the whole
+// level from anywhere you opened it.
+function explore(now) {
+  if (!O || !O.explore || S.drag || S.gdrag) return;
+  if (now - (S.youAt || 0) > 200 && away()) { S.youAt = now; readout(); }
+  if (now - (S.exploredAt || 0) < 250) return;
+  const o = O.origin, p = S.camera.position, wx = p.x + o[0], wy = p.y + o[1];
+  const T = O.terrain, half = T ? Math.min(T.w, T.h) * T.cell / 2 : 0;
+  const ground = !!T && Math.hypot(wx - (T.x0 + (T.w - 1) * T.cell / 2), wy - (T.y0 + (T.h - 1) * T.cell / 2)) > half * 0.35;
+  const wz = p.z + o[2];
+  if (!ground && Math.hypot(wx - S.centre[0], wy - S.centre[1]) < Math.max(5, O.radius * 0.3) &&
+      !(S.film && Math.abs(wz - (S.centreZ == null ? 1e9 : S.centreZ)) > 25)) return;
+  S.exploredAt = now;
+  S.centre = [wx, wy];
+  S.centreZ = wz;
+  // a cut set for the room it opened in means nothing out here: off, once
+  const cutEl = S.el.querySelector(".v3d-cut");
+  if (!S.cutFreed && +cutEl.value < 100 && Math.hypot(p.x, p.y) > O.radius) {
+    S.cutFreed = true;
+    cutEl.value = 100;
+    setCut(100);
+  }
+  let got = null;
+  // a cutscene asks every time: how far it sees depends on how high it is
+  try { got = O.explore(wx, wy, p.z + o[2], ground || !!S.film); }
+  catch (e) { console.warn("the close-up could not gather round the camera:", e); }   // tried again as it moves
+  if (!got) return;
+  if (got.terrain) {
+    O.terrain = got.terrain;
+    const old = S.root.children.find(c => c.userData.item && c.userData.item.type === "terrain");
+    if (old) { S.root.remove(old); drop(old); }
+    S.root.add(terrainMesh(O.terrain));
+    fogFor();
+  }
+  if (got.objects) update({ objects: got.objects, nav: got.nav });
+  if (got.splines) {
+    const keys = got.splines.map(t => t.key).sort().join("|");
+    if (keys !== S.splineKeys) {
+      if (S.splines) { S.root.remove(S.splines); drop(S.splines); }
+      O.splines = got.splines;
+      S.splines = got.splines.length ? splineMeshes(got.splines) : null;
+      if (S.splines) S.root.add(S.splines);
+    }
+  }
+  sunOver(Math.round(p.x), Math.round(p.y), Math.round(p.z));
+}
+
+// ------------------------------------------------------------------ views
+function frame() {
+  const r = O.radius;
+  const m = S.target ? S.target.userData.body.children.find(c => c.isMesh) : null;
+  const g = m ? new THREE.Box3().setFromObject(m) : null;
+  const c = g && !g.isEmpty() ? g.getCenter(new THREE.Vector3()) : new THREE.Vector3(0, 0, 1);
+  const size = g && !g.isEmpty() ? g.getSize(new THREE.Vector3()).length() : 1;
+  // close enough to see a pistol on a desk, far enough to take in a building
+  const d = Math.max(2.2, Math.min(Math.max(r, size * 1.3), size * 3.5 + 1.5));
+  return { c, r, d };
+}
+// ------------------------------------------------------------------ the free camera
+// A spectator's camera, as in a shooter's free roam: it looks from where it is.
+// Drag to look around, W A S D (or the arrows) to fly where it looks, Q and E
+// straight down and up, Shift fast; the wheel moves forward and back; right-drag
+// circles the item. yaw 0 looks north (+y), as an item's heading does.
+function dirOf(yaw, pitch) {
+  return new THREE.Vector3(-Math.sin(yaw) * Math.cos(pitch), Math.cos(yaw) * Math.cos(pitch), Math.sin(pitch));
+}
+function applyLook() {
+  S.pitch = Math.max(-1.55, Math.min(1.55, S.pitch));
+  S.camera.lookAt(S.camera.position.clone().add(dirOf(S.yaw, S.pitch)));
+}
+function lookAt(p) {
+  const d = new THREE.Vector3().subVectors(p, S.camera.position);
+  if (d.lengthSq() < 1e-8) return;
+  S.yaw = Math.atan2(-d.x, d.y);
+  S.pitch = Math.atan2(d.z, Math.hypot(d.x, d.y));
+  applyLook();
+}
+function itemCentre() {
+  const m = S.target ? S.target.userData.body.children.find(c => c.isMesh) : null;
+  const b = m ? new THREE.Box3().setFromObject(m) : null;
+  return b && !b.isEmpty() ? b.getCenter(new THREE.Vector3()) : new THREE.Vector3(0, 0, 1);
+}
+
+function setView(mode) {
+  vel.set(0, 0, 0);
+  S.el.querySelector(".v3d-test").hidden = !(mode === "walk" && O && O.onTest);
+  // walking starts on the floor under the camera, looking ahead
+  if (mode === "walk") {
+    const p = S.camera.position;
+    if (floorAt(p.x, p.y, p.z) != null || floorAt(p.x, p.y, p.z + 200) != null) {
+      if (floorAt(p.x, p.y, p.z) == null) p.z += 200;       // under the ground: up through it first
+      S.walking = true; S.viewMode = "walk"; S.pitch = -0.08;
+      settle(true); applyLook();
+      S.el.querySelectorAll('[data-g="view"] .btn').forEach(b => b.classList.toggle("on", b.dataset.v === "walk"));
+      help();
+      return;
+    }
+  }
+  S.walking = mode === "walk";
+  if (S.walking) mode = "eye";                // nothing under the camera: start where Eye level stands
+  S.viewMode = mode;
+  S.el.querySelectorAll('[data-g="view"] .btn').forEach(b => b.classList.toggle("on", b.dataset.v === mode));
+  const { c, r, d: dist } = frame();
+  const it = O.target, head = headingOf(it);
+  const fx = -Math.sin(head), fy = Math.cos(head);          // the item's forward: local +y
+  S.camera.fov = 60;
+  // looking through a camera, the camera itself is not in the way
+  if (S.target) S.target.visible = mode !== "cam";
+  if (mode === "top") {
+    S.camera.position.set(c.x + 0.01, c.y - 0.01, c.z + Math.max(6, r * 1.6));
+  } else if (mode === "eye") {
+    // standing in front of it, far enough to take it in, eyes 1.7 m over the ground there
+    const d = Math.max(3, dist * 0.9);
+    S.camera.position.set(c.x + fx * d, c.y + fy * d, (it.floor != null ? it.floor - O.origin[2] : c.z - 1) + 1.7);
+  } else if (mode === "player") {
+    // behind the player start and over it, looking the way it faces: the
+    // mission as the player first sees it, with the player in the picture
+    const fl = it.floor != null ? it.floor - O.origin[2] : 0;
+    S.camera.position.set(-fx * 4.5, -fy * 4.5, fl + 2.6);
+    S.camera.updateProjectionMatrix();
+    lookAt(new THREE.Vector3(fx * 12, fy * 12, fl + 1.2));
+    S.el.querySelectorAll('[data-g="view"] .btn').forEach(b => b.classList.remove("on"));
+    help();
+    return;
+  } else if (mode === "cam" && it.cam) {
+    // from the camera's own lens, looking where it looks
+    const pitch = it.cam.pitch || 0, h = head + (it.cam.pan || 0);
+    const dir = new THREE.Vector3(-Math.sin(h) * Math.cos(pitch), Math.cos(h) * Math.cos(pitch), Math.sin(pitch));
+    const eye = new THREE.Vector3(0, 0, (it.lift || 0) + 0.05).add(dir.clone().multiplyScalar(0.3));
+    S.camera.position.copy(eye);
+    S.camera.fov = Math.max(20, Math.min(100, it.cam.fovV || 40));
+    S.camera.updateProjectionMatrix();
+    lookAt(eye.clone().add(dir.multiplyScalar(5)));
+    return;
+  } else {
+    // in front of it and to one side; indoors from high up, over the cut-away walls
+    const d = dist, up = O.inside ? 1.6 : 0.7, back = O.inside ? 0.45 : 0.7;
+    S.camera.position.set(c.x + fx * d * back + fy * d * 0.45, c.y + fy * d * back - fx * d * 0.45, c.z + d * up);
+  }
+  S.camera.updateProjectionMatrix();
+  lookAt(c);
+  if (S.walking) {
+    S.el.querySelectorAll('[data-g="view"] .btn').forEach(b => b.classList.toggle("on", b.dataset.v === "walk"));
+    settle(true);
+  }
+  help();
+}
+// ------------------------------------------------------------------ walkways
+// The navmesh round the item (O.nav: nodes [x, y, z, own], links [x1..z2, own],
+// route [[x, y, z]...]): small posts and lines, yours gold, the level's in the
+// climb colour; the selected guard's patrol a gold line over them. Not picked.
+function makeNav() {
+  if (S.nav) { S.root.remove(S.nav); drop(S.nav); S.nav = null; }
+  const N = O && O.nav;
+  S.el.querySelector(".v3d-addnode").hidden = !(S.navOn && O && O.onAddNode);
+  if (!N || !S.navOn) return;
+  const o = O.origin, g = new THREE.Group();
+  const post = new THREE.CylinderGeometry(0.09, 0.09, 0.5, 8).rotateX(Math.PI / 2).translate(0, 0, 0.25);
+  const mats = [new THREE.MeshBasicMaterial({ color: 0x6fdcec }), new THREE.MeshBasicMaterial({ color: 0xffd24a })];
+  [0, 1].forEach(own => {
+    const list = N.nodes.filter(n => !!n[3] === !!own);
+    if (!list.length) return;
+    const im = new THREE.InstancedMesh(post, mats[own], list.length), m = new THREE.Matrix4();
+    list.forEach((n, i) => { m.makeTranslation(n[0] - o[0], n[1] - o[1], n[2] - o[2]); im.setMatrixAt(i, m); });
+    g.add(im);
+  });
+  [0, 1].forEach(own => {
+    const list = N.links.filter(l => !!l[6] === !!own);
+    if (!list.length) return;
+    const pos = new Float32Array(list.length * 6);
+    list.forEach((l, i) => { for (let k = 0; k < 6; k++) pos[i * 6 + k] = l[k] - o[k % 3] + (k % 3 === 2 ? 0.2 : 0); });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: own ? 0xffd24a : 0x6fdcec, transparent: true, opacity: 0.8 })));
+  });
+  if (N.route && N.route.length > 1) {
+    const geo = new THREE.BufferGeometry().setFromPoints(N.route.map(p => new THREE.Vector3(p[0] - o[0], p[1] - o[1], p[2] - o[2] + 0.45)));
+    g.add(new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffd24a })));
+  }
+  g.traverse(c => { c.raycast = () => {}; });
+  S.nav = g;
+  S.root.add(g);
+}
+function setAddingNode(on) {
+  S.addingNode = !!on && !!(O && O.onAddNode);
+  if (S.addingNode) unlock();             // a floor to click needs a pointer
+  S.el.querySelector(".v3d-addnode").classList.toggle("on", S.addingNode);
+  S.canvas.style.cursor = S.addingNode ? "crosshair" : "";
+  help();
+}
+
+// ------------------------------------------------------------------ walking
+// The eye 1.7 m over the floor under it. W A S D walk along the ground where it
+// looks (Shift runs); a step up to 0.55 m (stairs, a kerb) is climbed, a drop is
+// fallen down; a wall, a crate or a fence in the way stops it at knee, waist or
+// head height, and it slides along instead where it can.
+const EYE = 1.7, STEP_UP = 0.55, BODY = 0.3;
+// The ground from its own grid (a ray through the whole terrain mesh every frame
+// is slow); floors and roofs from the things near the point.
+function groundAt(x, y) {
+  const T = O && O.terrain;
+  if (!T) return null;
+  const o = O.origin, fx = (x + o[0] - T.x0) / T.cell, fy = (y + o[1] - T.y0) / T.cell;
+  const i = Math.floor(fx), j = Math.floor(fy);
+  if (i < 0 || j < 0 || i >= T.w - 1 || j >= T.h - 1) return null;
+  const hl = T.hole, k0 = j * T.w + i;
+  if (hl && (hl[k0] || hl[k0 + 1] || hl[k0 + T.w] || hl[k0 + T.w + 1])) return null;   // open ground: the floor is the building's
+  const u = fx - i, v = fy - j, z = (a, b) => T.z[b * T.w + a];
+  const zz = (z(i, j) * (1 - u) + z(i + 1, j) * u) * (1 - v) + (z(i, j + 1) * (1 - u) + z(i + 1, j + 1) * u) * v;
+  return zz === zz ? zz - o[2] : null;
+}
+function near(x, y, r) {
+  return S.items.filter(g => {
+    const b = g.userData.box || (g.userData.box = new THREE.Box3().setFromObject(g));
+    return !b.isEmpty() && x > b.min.x - r && x < b.max.x + r && y > b.min.y - r && y < b.max.y + r;
+  });
+}
+function floorAt(x, y, fromZ) {
+  S.ray.set(new THREE.Vector3(x, y, fromZ), new THREE.Vector3(0, 0, -1));
+  S.ray.far = 80;
+  const h = hits(S.ray, false, near(x, y, 0.1)).find(q => q.normal.z > FLOOR_UP && support(q.item)) || null;
+  S.ray.far = Infinity;
+  const g = groundAt(x, y);
+  const f = h ? h.point.z : null;
+  if (g != null && g <= fromZ && (f == null || g > f)) return g;
+  return f;
+}
+function wallAhead(p, dir, len) {
+  const list = near(p.x + dir.x * len / 2, p.y + dir.y * len / 2, len + BODY);
+  if (!list.length) return false;
+  for (const up of [STEP_UP + 0.1, 1.1, 1.6]) {
+    S.ray.set(new THREE.Vector3(p.x, p.y, p.z - EYE + up), dir);
+    S.ray.far = len + BODY;
+    const w = hits(S.ray, false, list).find(q => Math.abs(q.normal.z) < 0.7 && support(q.item));
+    S.ray.far = Infinity;
+    if (w) return true;
+  }
+  return false;
+}
+// keep the eye over the floor: now (entering) or falling at 9 m/s; standing
+// still on it, nothing to do
+function settle(now, dt) {
+  const p = S.camera.position, k = p.x.toFixed(3) + "," + p.y.toFixed(3) + "," + p.z.toFixed(3);
+  if (!now && S.settled === k) return;
+  const fl = floorAt(p.x, p.y, p.z - EYE + STEP_UP + 0.02);
+  if (fl == null) return;
+  const want = fl + EYE;
+  if (now || want > p.z) p.z = want;
+  else p.z = Math.max(want, p.z - 9 * (dt || 0.016));
+  S.settled = p.x.toFixed(3) + "," + p.y.toFixed(3) + "," + p.z.toFixed(3);
+}
+function walk(mx, my, dt) {
+  const f = new THREE.Vector3(-Math.sin(S.yaw), Math.cos(S.yaw), 0), r = new THREE.Vector3(Math.cos(S.yaw), Math.sin(S.yaw), 0);
+  const d = new THREE.Vector3().addScaledVector(f, my).addScaledVector(r, mx);
+  if (d.lengthSq() > 0) {
+    const m = Math.min(1, d.length());          // the input eases in and out
+    d.normalize().multiplyScalar((fast ? 7 : 3.5) * dt * m);
+    const p = S.camera.position;
+    // the whole step, or else along x or y alone (sliding along a wall)
+    for (const s of [d, new THREE.Vector3(d.x, 0, 0), new THREE.Vector3(0, d.y, 0)]) {
+      const len = s.length();
+      if (len < 1e-5) continue;
+      if (wallAhead(p, s.clone().divideScalar(len), len)) continue;
+      if (floorAt(p.x + s.x, p.y + s.y, p.z - EYE + STEP_UP + 0.02) == null) continue;   // off the edge of the world
+      p.add(s);
+      break;
+    }
+  }
+  settle(false, dt);
+}
+function headingOf(it) {
+  // the item's facing in the world: its heading angle plus a quarter turn (local +y)
+  // (a rifle on its side points its barrel, local +y, at minus alpha)
+  const rot = it.rot || [0, 0, it.gamma || 0];
+  return it.head === 0 ? -rot[0] : rot[2];
+}
+
+// A cut set for the room the close-up opened in is for that room: what stands
+// round it is cut, and the rest of the level keeps its tops - a watchtower's
+// head, the floors of the building across the yard. Set by hand anywhere else,
+// the cut is the level's.
+function cutFor(it) {
+  const r = O && O.room;
+  if (!r || !it || it.x == null) return [S.cut];
+  return Math.hypot(it.x - r.x, it.y - r.y) <= r.r ? [S.cut] : [];
+}
+function setCut(v) {
+  const el = S.el.querySelector(".v3d-cutv");
+  if (v >= 100) {
+    S.cut.constant = 1e6;
+    el.textContent = "off";
+  } else {
+    // 0..99 -> 1 m under the item to 12 m over it
+    const h = -1 + v / 99 * 13;
+    S.cut.constant = h;
+    el.textContent = (h >= 0 ? "+" : "") + h.toFixed(1) + " m";
+  }
+}
+function setXray(on) {
+  for (const g of S.items) {
+    const it = g.userData.item;
+    if (it.key === O.target.key || it.type !== "building") continue;
+    g.traverse(c => {
+      if (c.isMesh) {
+        (Array.isArray(c.material) ? c.material : [c.material]).forEach(m => {
+          m.transparent = on;
+          m.opacity = on ? 0.22 : 1;
+          m.depthWrite = !on;
+        });
+        c.castShadow = !on;
+      }
+    });
+  }
+}
+
+// ------------------------------------------------------------------ picking
+const ndc = new THREE.Vector2();
+function cast(e, skipTarget) {
+  const r = S.canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  S.ray.setFromCamera(ndc, S.camera);
+  return hits(S.ray, skipTarget);
+}
+function hits(ray, skipTarget, list) {
+  const out = ray.intersectObjects(list || S.root.children, true);
+  return out.filter(h => {
+    if (!h.face || !h.object.isMesh) return false;
+    const it = h.object.userData.item;
+    if (!it) return false;
+    if (skipTarget && it.key === O.target.key) return false;
+    // see-through faces (nets, grilles, foliage cards) are not something to click or stand on
+    const mm = h.object.material, mat = Array.isArray(mm) ? mm[h.face.materialIndex] : mm;
+    if (mat && mat.alphaTest > 0 && it.key !== O.target.key) return false;
+    // above the cut, nothing is there
+    if (S.cut.constant < 1e5 && h.point.z > S.cut.constant && it.key !== O.target.key && it.type !== "terrain" && cutFor(it).length) return false;
+    return true;
+  }).map(h => {
+    const n = h.face.normal.clone().transformDirection(h.object.matrixWorld);
+    if (n.dot(ray.ray.direction) > 0) n.negate();     // the side that faces us
+    return { point: h.point, normal: n, item: h.object.userData.item, dist: h.distance };
+  });
+}
+// what a wall item hangs on: the first wall behind it, within a metre
+function behind(p) {
+  const it = O.target, o = O.origin, rot = p.rot || it.rot || [0, 0, 0];
+  const h = rot[hi(it)] || 0;
+  const back = new THREE.Vector3(Math.sin(h), -Math.cos(h), 0);
+  S.ray.set(new THREE.Vector3(p.x - o[0], p.y - o[1], p.z - o[2] + (it.lift || 0) + 0.1), back);
+  S.ray.far = 1.2;
+  const w = hits(S.ray, true).filter(q => Math.abs(q.normal.z) < WALL_FLAT)[0];
+  S.ray.far = Infinity;
+  return w ? w.item.name : "";
+}
+// nothing stands on a rifle or a guard
+function support(it) { return !/^(pickup|soldier|player|ghost|camera|switch|siren|alarmlight)$/.test(it.type); }
+// the surface straight below a point (skipping the target); big: floors and
+// ground only, not a lamp or a crate under it
+function below(p, reach = 30, big = false) {
+  S.ray.set(new THREE.Vector3(p.x, p.y, p.z + 0.05), new THREE.Vector3(0, 0, -1));
+  S.ray.far = reach;
+  const h = hits(S.ray, true).filter(q => q.normal.z > FLOOR_UP && support(q.item) &&
+    (!big || q.item.type === "terrain" || q.item.type === "building")).find(() => true) || null;
+  S.ray.far = Infinity;
+  return h;
+}
+// the ceiling over the item: the first thing straight above it, within 8 m
+function ceiling() {
+  const m = S.target ? S.target.userData.body.children.find(c => c.isMesh) : null;
+  const b = m ? new THREE.Box3().setFromObject(m) : null;
+  if (!b || b.isEmpty()) return null;
+  const c = b.getCenter(new THREE.Vector3());
+  // from head height over the floor, so a shelf over a desk is not the ceiling
+  const fl = below(new THREE.Vector3(c.x, c.y, b.min.z + 0.1), 30, true);
+  const z0 = Math.max(b.max.z + 0.05, fl ? fl.point.z + 1.9 : -1e9);
+  S.ray.set(new THREE.Vector3(c.x, c.y, z0), new THREE.Vector3(0, 0, 1));
+  S.ray.far = 8;
+  const h = hits(S.ray, true).find(q => q.item.type !== "terrain") || null;
+  S.ray.far = Infinity;
+  return h ? h.point.z : null;
+}
+
+// the lowest point of the target's own model, turned as it is: what rests on the floor
+function footOf(it, rot) {
+  it = it || O.target;
+  const g = it.model ? geometryOf(it.model) : null;
+  if (!g) return 0;
+  const m = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(rot[0] || 0, rot[1] || 0, rot[2] || 0, "ZYX"));
+  const p = g.attributes.position, v = new THREE.Vector3();
+  let lo = Infinity;
+  const stepN = Math.max(1, Math.floor(p.count / 4000));
+  for (let i = 0; i < p.count; i += stepN) {
+    v.fromBufferAttribute(p, i).applyMatrix4(m);
+    if (v.z < lo) lo = v.z;
+  }
+  return (lo === Infinity ? 0 : lo) + (it.lift || 0);
+}
+
+// ------------------------------------------------------------------ moving the target
+function poseFrom(hit, e, it) {
+  it = it || O.target;
+  const o = O.origin;
+  const rot = (it.rot || [0, 0, it.gamma || 0]).slice();
+  if (it.kind === "wall") {
+    const n = hit.normal;
+    const g = Math.atan2(n.y, n.x) - Math.PI / 2 + (it === O.target ? S.turn : 0);
+    rot[hi(it)] = g;
+    return { x: hit.point.x + n.x * WALL_OFF + o[0], y: hit.point.y + n.y * WALL_OFF + o[1],
+      z: hit.point.z + o[2], rot, on: hit.item.name, gamma: g };
+  }
+  return { x: hit.point.x + o[0], y: hit.point.y + o[1], z: hit.point.z + o[2] - footOf(it, rot),
+    rot, on: hit.item.name, gamma: headOf(it, rot) };
+}
+function surfaceFor(e, it) {
+  it = it || O.target;
+  const hs = cast(e, it === O.target).filter(h => support(h.item));   // an item in hand can go onto the one being edited
+  if (!hs.length) return null;
+  if (it.kind === "wall") return hs.filter(h => Math.abs(h.normal.z) < WALL_FLAT && h.item.type !== "terrain")[0] || null;
+  const first = hs[0];
+  if (first.normal.z > FLOOR_UP) return first;
+  // a wall under the pointer: the floor at its foot, on this side of it
+  const p = first.point.clone().add(first.normal.clone().multiplyScalar(0.3));
+  p.z += 0.3;
+  return below(p, 60);
+}
+function applyPose(p) {
+  const it = O.target;
+  it.x = p.x; it.y = p.y; it.z = p.z; it.rot = p.rot;
+  if (S.target) place(S.target, it);
+  readout(p);
+}
+
+// ------------------------------------------------------------------ the mouse and the keys
+// One mode, as in Unreal Engine. With no button held the mouse is free: it
+// points (what is under it is named), and a click selects what it is on - or
+// nothing (the ground, the sky). The selected thing moves only by its gizmo
+// (W move, E rotate; Q none). Holding the left button looks round (the
+// pointer locked while it is held), the right button circles the selected
+// thing (or the middle of the view), the middle button pans; while one is held
+// W A S D fly and Q E go down and up. The arrows fly at any time. The wheel
+// sets how fast the camera flies.
+const SENS = 0.0024;            // radians of turn per pixel of mouse
+const SPEEDS = [1, 2, 4, 7, 11, 18, 30, 50, 80, 120];   // the camera's speeds, metres a second
+const SPEED_START = 7;                                   // "Speed 8": 50 m/s
+function lockable() { return !!S && !S.dead && !S.film; }
+function lock() {
+  if (!lockable() || S.el.hidden || document.pointerLockElement === S.canvas) return;
+  try {
+    const p = S.canvas.requestPointerLock();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) { /* the mouse is turned by its moves without it */ }
+}
+function unlock() { if (document.pointerLockElement === S.canvas) document.exitPointerLock(); }
+function onLockChange() {
+  if (!S) return;
+  S.locked = document.pointerLockElement === S.canvas;
+  // Esc took the pointer back in the middle of a look: the look is over
+  if (!S.locked && S.look) { S.look = null; S.down = null; S.mouseHeld = false; }
+  S.el.classList.toggle("looking", S.locked);
+  if (S.locked) tip(null);
+}
+function hint() { if (S) S.el.querySelector(".v3d-hint").hidden = true; }
+// Where the view is aimed, in game metres: what the crosshair is on (the ground,
+// a floor, anything solid), else a few metres in front of the camera. Copies are
+// pasted here.
+function aimPoint() {
+  const r = S.canvas.getBoundingClientRect(), e = { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+  const h = cast(e, false)[0];
+  const p = h ? h.point.clone() : S.camera.position.clone().addScaledVector(dirOf(S.yaw, S.pitch), 8);
+  return { x: +(p.x + O.origin[0]).toFixed(2), y: +(p.y + O.origin[1]).toFixed(2), z: +(p.z + O.origin[2]).toFixed(2) };
+}
+// what a right-drag circles: the selected thing, else what the middle of the
+// view is on, else a point 10 m ahead
+function orbitPivot() {
+  if (selected()) return itemCentre();
+  const r = S.canvas.getBoundingClientRect(), e = { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+  const h = cast(e, false)[0];
+  if (h && h.dist < 400) return h.point.clone();
+  return S.camera.position.clone().addScaledVector(dirOf(S.yaw, S.pitch), 10);
+}
+// is the target selected (a click on the ground or the sky leaves nothing selected)
+function selected() { return !!(S && O && O.target && !S.noSel && S.target); }
+function movable() { const t = O && O.target; return !!(selected() && t.editable && t.kind !== "fixed"); }
+function setSpeed(i) {
+  S.speed = Math.max(0, Math.min(SPEEDS.length - 1, i));
+  try { localStorage.setItem("plotter:v3dspeed2", String(S.speed)); } catch (e) { /* private window */ }
+  const b = S.el.querySelector(".v3d-speed");
+  b.innerHTML = "Speed <b>" + (S.speed + 1) + "</b>";
+  b.title = "The camera's speed: " + SPEEDS[S.speed] + " m/s (the wheel changes it; Shift is three times as fast)";
+  b.classList.add("flash");
+  clearTimeout(S.speedFlash);
+  S.speedFlash = setTimeout(() => b.classList.remove("flash"), 900);
+}
+function onWheel(e) {
+  e.preventDefault();
+  if (S.film) return;
+  setSpeed((S.speed == null ? SPEED_START : S.speed) + (e.deltaY < 0 ? 1 : -1));
+}
+function onDown(e) {
+  S.canvas.focus();
+  // a cutscene playing: a click pauses it, or plays it on, as a film's would
+  if (S.film) { e.preventDefault(); if (e.button === 0) filmPlay(!S.film.playing); return; }
+  try { S.canvas.setPointerCapture(e.pointerId); } catch (err) { /* a synthetic pointer */ }
+  S.mouseHeld = true;
+  // the gizmo first: only a handle of it moves or turns the selected thing
+  if (e.button === 0 && !S.placing && !S.addingNode) {
+    const g = gizHit(e);
+    if (g) { gizStart(g, e); return; }
+  }
+  const h = cast(e, false)[0];
+  S.down = { x: e.clientX, y: e.clientY, button: e.button, hit: h || null, moved: false };
+}
+function startLook(e) {
+  const d = S.down, b = d.button;
+  S.look = { orbit: b === 2 && !S.walking, pan: b === 1, pivot: b === 2 ? orbitPivot() : null };
+  if (S.look.orbit) S.look.pivot = orbitPivot();
+  tip(null);
+  lock();
+}
+function onMove(e) {
+  if (S.gdrag) { gizDrag(e); return; }
+  if (S.down && !S.look && Math.hypot(e.clientX - S.down.x, e.clientY - S.down.y) > 4) { S.down.moved = true; startLook(e); }
+  if (S.look) {
+    const L = S.look, dx = e.movementX || 0, dy = e.movementY || 0;
+    if (L.orbit) {
+      // round the pivot: the camera's offset from it turned, and looking at it
+      const off = new THREE.Vector3().subVectors(S.camera.position, L.pivot);
+      const r = off.length() || 1, a0 = Math.atan2(off.y, off.x), e0 = Math.asin(Math.max(-1, Math.min(1, off.z / r)));
+      const a = a0 - dx * 0.0062, el = Math.max(-1.45, Math.min(1.45, e0 + dy * 0.0062));
+      S.camera.position.set(L.pivot.x + r * Math.cos(el) * Math.cos(a), L.pivot.y + r * Math.cos(el) * Math.sin(a), L.pivot.z + r * Math.sin(el));
+      lookAt(L.pivot);
+    } else if (L.pan) {
+      // sideways and up as the view is turned, more the faster the camera is set
+      const k = 0.004 * SPEEDS[S.speed] + 0.004;
+      const right = new THREE.Vector3(Math.cos(S.yaw), Math.sin(S.yaw), 0);
+      const up = new THREE.Vector3().crossVectors(right, dirOf(S.yaw, S.pitch)).normalize();
+      S.camera.position.addScaledVector(right, -dx * k).addScaledVector(up, dy * k);
+    } else {
+      S.yaw -= dx * SENS;
+      S.pitch -= dy * SENS;
+      applyLook();
+    }
+    return;
+  }
+  if (e.buttons) { tip(null); return; }
+  if (S.placing && S.ghost) { ghostAt(e); tip(null); return; }
+  // pointing: the handle under it lit, else what it is on named
+  const g = !S.addingNode ? gizHit(e) : null;
+  gizHot(g ? g.handle : null);
+  S.canvas.style.cursor = g ? "pointer" : "";
+  if (g) { tip(null); return; }
+  const h = cast(e, false)[0];
+  tip(h ? h.item : null, e);
+}
+function onUp(e) {
+  const d = S.down;
+  S.down = null;
+  S.mouseHeld = false;
+  try { S.canvas.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+  if (S.gdrag) { gizEnd(); return; }
+  if (S.look) { S.look = null; unlock(); return; }
+  if (!d || d.moved || d.button !== 0) return;
+  if (S.addingNode) {
+    const h = cast(e, false).find(q => q.normal.z > FLOOR_UP && support(q.item));
+    if (h && O.onAddNode) O.onAddNode({ x: +(h.point.x + O.origin[0]).toFixed(2), y: +(h.point.y + O.origin[1]).toFixed(2),
+      z: +(h.point.z + O.origin[2]).toFixed(2) });
+    return;
+  }
+  // with an item in hand, a click puts it down
+  if (S.placing && S.ghost) {
+    const p = ghostAt(e);
+    if (p && O.onPlace) O.onPlace({ x: +p.x.toFixed(3), y: +p.y.toFixed(3), z: +p.z.toFixed(3),
+      gamma: +headOf(S.ghost.userData.item, p.rot).toFixed(5), on: p.on || "" });
+    return;
+  }
+  // a click selects what it is on; the ground, the sky or the level's fixtures: nothing
+  const it = d.hit && d.hit.item;
+  if (it && it.key === O.target.key) {
+    if (!S.noSel) return;
+    if (O.onPick) O.onPick(it.key); else { S.noSel = false; remakeTarget(); readout(); help(); }
+    return;
+  }
+  if (it && pickable(it) && O.onPick) { S.noSel = false; O.onPick(it.key); return; }
+  deselect();
+}
+// nothing selected: no gizmo, and the thing no longer looks selected; the
+// map lets go of it too
+function deselect() {
+  if (!S || S.noSel) return;
+  S.noSel = true;
+  remakeTarget();
+  readout();
+  help();
+  if (O.onDeselect) O.onDeselect();
+}
+// the target made again, as selected or not
+function remakeTarget() {
+  const g = S.target;
+  if (!g || !g.parent) return;
+  const it = g.userData.item;
+  S.root.remove(g); drop(g);
+  const n = makeItem(it);
+  S.root.add(n);
+  S.items[S.items.indexOf(g)] = n;
+  S.byKey.set(it.key, n);
+  S.target = n;
+  if (S.el.querySelector(".v3d-xray").checked) setXray(true);
+}
+function commit(p) {
+  const it = O.target;
+  it.x = p.x; it.y = p.y; it.z = p.z; it.rot = p.rot;
+  // the editor's heading: the angle that carries it, less what the level added;
+  // a building or a prop also its tilt (alpha about east, beta about north)
+  const q = { x: +p.x.toFixed(3), y: +p.y.toFixed(3), z: +p.z.toFixed(3), gamma: +headOf(it, p.rot).toFixed(5), on: p.on || "" };
+  if (tilts(it)) { q.alpha = +((p.rot[0] || 0)).toFixed(5); q.beta = +((p.rot[1] || 0)).toFixed(5); }
+  if (O.onMove) O.onMove(it.key, q);
+  S.miniStale = true;
+  readout(p);
+}
+function turnBy(a) {
+  const it = O.target;
+  if (!movable()) return;
+  const rot = (it.rot || [0, 0, 0]).slice();
+  rot[hi(it)] = (rot[hi(it)] || 0) + sgn(it) * a;      // anticlockwise, whatever carries it
+  S.turn += a;
+  const p = { x: it.x, y: it.y, z: it.z, rot, on: "" };
+  applyPose(p);
+  commit(p);
+}
+function nudge(dx, dy, dz) {
+  const it = O.target;
+  if (!movable()) return;
+  // along the view: "up" is away from the camera
+  const f = dirOf(S.yaw, 0);
+  const r = new THREE.Vector3(f.y, -f.x, 0);
+  const p = { x: it.x + r.x * dx + f.x * dy, y: it.y + r.y * dx + f.y * dy, z: it.z + dz, rot: (it.rot || [0, 0, 0]).slice(), on: "" };
+  applyPose(p);
+  commit(p);
+}
+// End: down onto the floor or the ground under it
+function dropToFloor() {
+  const it = O.target, o = O.origin;
+  if (!movable()) return;
+  const rot = (it.rot || [0, 0, 0]).slice();
+  const h = below(new THREE.Vector3(it.x - o[0], it.y - o[1], it.z - o[2] + 0.3), 200);
+  if (!h) return;
+  const p = { x: it.x, y: it.y, z: h.point.z + o[2] - footOf(it, rot), rot, on: h.item.name };
+  applyPose(p);
+  commit(p);
+}
+
+// ------------------------------------------------------------------ the gizmo
+// As in Unreal: the selected thing moves only by its gizmo, drawn over
+// everything at the same size on screen. Move: arrows east (red), north
+// (green) and up (blue), the squares between two of them for their plane, and
+// the ball in the middle, which drags it over floors and walls under the
+// pointer as before (a wall item onto walls). Rotate: a ring about each axis;
+// a soldier, a pickup, a camera or a switch turns only about up (their
+// heading), a building or a prop about all three (the game's alpha, beta,
+// gamma). Scale the game does not have: a building or a prop is a position, an
+// orientation and a model, nothing for its size.
+const GIZ = { x: 0xe8473e, y: 0x62d26c, z: 0x4f8dff, free: 0xf4f4f4, plane: 0xffd24a, hot: 0xffe37a };
+const GIZ_PX = 120;                         // its size on screen, pixels
+function tilts(it) { return !!it && (it.type === "building" || it.type === "prop") && hi(it) === 2 && it.kind !== "wall"; }
+function gizBuild() {
+  const scene = new THREE.Scene(), g = new THREE.Group();
+  scene.add(g);
+  const parts = { move: new THREE.Group(), rotate: new THREE.Group() };
+  g.add(parts.move, parts.rotate);
+  const handles = [];
+  function mesh(geo, col, handle, group, op) {
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: col, depthTest: false, depthWrite: false,
+      transparent: true, opacity: op || 1, side: THREE.DoubleSide }));
+    m.renderOrder = 1000;
+    m.userData = { handle, col, op: op || 1 };
+    group.add(m);
+    return m;
+  }
+  function pick(geo, handle, group) {
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ visible: false }));
+    m.userData = { handle, pick: true };
+    group.add(m);
+    handles.push(m);
+    return m;
+  }
+  // the three arrows: built along +y, turned onto their axis
+  const turn = { x: [0, 0, -Math.PI / 2], y: [0, 0, 0], z: [Math.PI / 2, 0, 0] };
+  ["x", "y", "z"].forEach(a => {
+    const shaft = new THREE.CylinderGeometry(0.022, 0.022, 0.78, 10).translate(0, 0.39, 0);
+    const head = new THREE.ConeGeometry(0.075, 0.22, 16).translate(0, 0.89, 0);
+    const hit = new THREE.CylinderGeometry(0.09, 0.09, 1.0, 8).translate(0, 0.52, 0);
+    [shaft, head, hit].forEach(geo => geo.applyMatrix4(new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(...turn[a]))));
+    const h = { kind: "move", axis: a };
+    mesh(shaft, GIZ[a], h, parts.move); mesh(head, GIZ[a], h, parts.move); pick(hit, h, parts.move);
+  });
+  // the planes: a right angle joining the two arrows - each side in the colour
+  // of the arrow it runs along, as Unreal's - with a faint square inside it
+  // to take hold of
+  const C = 0.34, bar = (from, to, col, h) => {
+    const a = new THREE.Vector3(...from), b = new THREE.Vector3(...to), d = b.clone().sub(a);
+    const geo = new THREE.CylinderGeometry(0.016, 0.016, d.length(), 8);
+    geo.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), d.clone().normalize()));
+    geo.translate(...a.clone().add(b).multiplyScalar(0.5).toArray());
+    mesh(geo, col, h, parts.move);
+  };
+  [["xy", 2], ["xz", 1], ["yz", 0]].forEach(([a, n]) => {
+    const h = { kind: "move", axis: a }, i0 = "xyz".indexOf(a[0]), i1 = "xyz".indexOf(a[1]);
+    const p0 = [0, 0, 0], p1 = [0, 0, 0], pc = [0, 0, 0];
+    p0[i0] = C; p1[i1] = C; pc[i0] = C; pc[i1] = C;
+    bar(p0, pc, GIZ[a[1]], h);          // from the first arrow, along the second
+    bar(p1, pc, GIZ[a[0]], h);          // from the second, along the first
+    const sq = new THREE.PlaneGeometry(C, C);
+    const turnTo = [[0, Math.PI / 2, 0], [Math.PI / 2, 0, 0], [0, 0, 0]][n];
+    sq.applyMatrix4(new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(...turnTo)));
+    const mid = [0, 0, 0]; mid[i0] = C / 2; mid[i1] = C / 2;
+    sq.translate(...mid);
+    mesh(sq, GIZ.plane, h, parts.move, 0.16);
+    pick(sq.clone(), h, parts.move);
+  });
+  // the ball: over floors and walls, as an item was dragged before
+  const ball = new THREE.SphereGeometry(0.075, 16, 12);
+  mesh(ball, GIZ.free, { kind: "move", axis: "free" }, parts.move);
+  pick(new THREE.SphereGeometry(0.12, 10, 8), { kind: "move", axis: "free" }, parts.move);
+  // the rings: half a ring about each axis - the half towards the camera,
+  // turned so each frame (ringFace) - in the ring's own frame: x along u1,
+  // y along u2, z the axis (ringBasis)
+  ["x", "y", "z"].forEach(a => {
+    const geo = new THREE.TorusGeometry(0.8, 0.018, 6, 40, Math.PI);
+    const hit = new THREE.TorusGeometry(0.8, 0.075, 6, 28, Math.PI);
+    const h = { kind: "rotate", axis: a };
+    const m = mesh(geo, GIZ[a], h, parts.rotate);
+    m.userData.ring = a;
+    const p = pick(hit, h, parts.rotate);
+    p.userData.ring = a;
+  });
+  g.visible = false;
+  return { scene, g, parts, handles, hot: null };
+}
+function gizShown() {
+  return !!(S && S.giz && O && movable() && !S.placing && !S.film && !S.addingNode &&
+    (S.gizMode === "move" || S.gizMode === "rotate"));
+}
+// placed at the selected thing's origin, as big on screen whatever the distance
+// a ring's frame: u1, u2 across it and its axis a, as ringAngle measures angles
+function ringBasis(a) {
+  const u = Math.abs(a.z) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+  const u1 = new THREE.Vector3().crossVectors(u, a).normalize(), u2 = new THREE.Vector3().crossVectors(a, u1);
+  return [u1, u2];
+}
+// each half ring turned towards the camera: the half from 90 degrees one side
+// of the camera's direction (in the ring's plane) to 90 degrees the other
+const _rq = new THREE.Quaternion(), _rm = new THREE.Matrix4(), _rz = new THREE.Quaternion();
+function ringFace() {
+  const G = S.giz, c = S.camera.position.clone().sub(G.g.position);
+  G.parts.rotate.children.forEach(m => {
+    const name = m.userData.ring;
+    if (!name) return;
+    const a = AXES[name], [u1, u2] = ringBasis(a);
+    const th = Math.atan2(c.dot(u2), c.dot(u1));
+    _rm.makeBasis(u1, u2, a);
+    _rq.setFromRotationMatrix(_rm);
+    _rz.setFromAxisAngle(new THREE.Vector3(0, 0, 1), th - Math.PI / 2);
+    m.quaternion.copy(_rq).multiply(_rz);
+  });
+}
+// how big the gizmo is drawn: GIZ_PX on screen, but never much bigger than
+// the thing itself once it is far off and small - and never under GIZ_MIN_PX,
+// to keep a handle to take hold of
+const GIZ_MIN_PX = 36;
+function gizSize() {
+  const G = S.giz, d = S.camera.position.distanceTo(G.g.position);
+  const perPx = 2 * d * Math.tan(S.camera.fov * Math.PI / 360) / (S.canvas.clientHeight || 600);
+  const t = S.target;
+  if (t && t.userData.gizR == null) {
+    const b = new THREE.Box3().setFromObject(t.userData.body || t);
+    t.userData.gizR = b.isEmpty() ? 1 : Math.max(0.3, b.getSize(new THREE.Vector3()).length() / 2);
+  }
+  const fit = t ? t.userData.gizR * 1.6 : Infinity;
+  return Math.max(0.02, Math.min(GIZ_PX * perPx, Math.max(GIZ_MIN_PX * perPx, fit)));
+}
+function gizPlace() {
+  const G = S.giz;
+  if (!G) return;
+  const on = gizShown();
+  G.g.visible = on;
+  if (!on) return;
+  G.parts.move.visible = S.gizMode === "move";
+  G.parts.rotate.visible = S.gizMode === "rotate";
+  // a soldier, a pickup, a camera turns only about up
+  const full = tilts(O.target);
+  G.parts.rotate.children.forEach(c => { if (c.userData.ring && c.userData.ring !== "z") c.visible = full; });
+  G.g.position.copy(S.target.position);
+  G.g.scale.setScalar(gizSize());
+  if (S.gizMode === "rotate") ringFace();
+}
+function gizHot(handle) {
+  const G = S.giz;
+  if (!G || G.hot === handle) return;
+  G.hot = handle;
+  G.g.traverse(m => {
+    if (!m.isMesh || m.userData.pick || !m.material) return;
+    const on = handle && m.userData.handle && m.userData.handle.kind === handle.kind && m.userData.handle.axis === handle.axis;
+    m.material.color.setHex(on ? GIZ.hot : m.userData.col);
+    m.material.opacity = on ? 1 : m.userData.op;
+  });
+}
+function gizHit(e) {
+  if (!gizShown()) return null;
+  gizPlace();
+  const r = S.canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  S.ray.setFromCamera(ndc, S.camera);
+  const list = S.giz.handles.filter(m => {
+    for (let p = m; p; p = p.parent) if (!p.visible) return false;
+    return true;
+  });
+  S.giz.g.updateMatrixWorld(true);
+  const h = S.ray.intersectObjects(list, false)[0];
+  return h ? { handle: h.object.userData.handle } : null;
+}
+const AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
+function rayAt(e) {
+  const r = S.canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  S.ray.setFromCamera(ndc, S.camera);
+  return S.ray.ray;
+}
+// where along the line P + t a the pointer's ray passes closest
+function axisT(ray, P, a) {
+  const w0 = new THREE.Vector3().subVectors(P, ray.origin);
+  const b = a.dot(ray.direction), d = a.dot(w0), e2 = ray.direction.dot(w0), den = 1 - b * b;
+  if (Math.abs(den) < 1e-3) return null;
+  return (b * e2 - d) / den;
+}
+function planeHit(ray, P, n) {
+  const pl = new THREE.Plane().setFromNormalAndCoplanarPoint(n, P), out = new THREE.Vector3();
+  return ray.intersectPlane(pl, out) ? out : null;
+}
+// the angle of the pointer round axis a through P, in the ring's plane
+function ringAngle(ray, P, a) {
+  if (Math.abs(ray.direction.dot(a)) < 0.06) return null;          // the ring seen edge-on
+  const h = planeHit(ray, P, a);
+  if (!h) return null;
+  const u = Math.abs(a.z) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+  const u1 = new THREE.Vector3().crossVectors(u, a).normalize(), u2 = new THREE.Vector3().crossVectors(a, u1);
+  const v = h.sub(P);
+  return Math.atan2(v.dot(u2), v.dot(u1));
+}
+function gizStart(g, e) {
+  const it = O.target, o = O.origin, h = g.handle;
+  const P = new THREE.Vector3(it.x - o[0], it.y - o[1], it.z - o[2]);
+  const ray = rayAt(e);
+  const D = { h, P, x0: it.x, y0: it.y, z0: it.z, rot0: (it.rot || [0, 0, 0]).slice(), pose: null, cx: e.clientX, cy: e.clientY, turned: 0 };
+  if (h.kind === "move" && AXES[h.axis]) D.t0 = axisT(ray, P, AXES[h.axis]);
+  else if (h.kind === "move" && h.axis.length === 2) {
+    D.n = AXES["xyz".replace(h.axis[0], "").replace(h.axis[1], "")];
+    D.h0 = planeHit(ray, P, D.n);
+  } else if (h.kind === "rotate") { D.a0 = ringAngle(ray, P, AXES[h.axis]); D.last = D.a0; }
+  S.gdrag = D;
+  gizHot(h);
+  tip(null);
+}
+function snapTo(v, step) { return Math.round(v / step) * step; }
+function gizDrag(e) {
+  const D = S.gdrag, it = O.target, h = D.h, ray = rayAt(e);
+  let p = null, label = "";
+  if (h.kind === "move" && h.axis === "free") {
+    // over floors and walls, as before; Shift: straight up and down
+    if (e.shiftKey) {
+      const d = S.camera.position.distanceTo(itemCentre());
+      p = { x: it.x, y: it.y, z: D.z0 + (D.cy - e.clientY) * d / 600, rot: D.rot0.slice(), on: "" };
+    } else {
+      const s = surfaceFor(e);
+      if (!s) return;
+      p = poseFrom(s, e);
+    }
+  } else if (h.kind === "move") {
+    let dx = 0, dy = 0, dz = 0;
+    if (AXES[h.axis]) {
+      const t = axisT(ray, D.P, AXES[h.axis]);
+      if (t == null || D.t0 == null) return;
+      const v = t - D.t0;
+      if (h.axis === "x") dx = v; else if (h.axis === "y") dy = v; else dz = v;
+    } else {
+      const q = planeHit(ray, D.P, D.n);
+      if (!q || !D.h0) return;
+      const v = q.sub(D.h0);
+      dx = h.axis.includes("x") ? v.x : 0; dy = h.axis.includes("y") ? v.y : 0; dz = h.axis.includes("z") ? v.z : 0;
+    }
+    // too far a pull (the ray almost along the axis) is no move at all
+    if (Math.hypot(dx, dy, dz) > 400) return;
+    let x = D.x0 + dx, y = D.y0 + dy, z = D.z0 + dz;
+    if (S.snapMove) {
+      if (dx) x = snapTo(x, SNAP_M); if (dy) y = snapTo(y, SNAP_M); if (dz) z = snapTo(z, SNAP_M);
+    }
+    p = { x, y, z, rot: D.rot0.slice(), on: "" };
+    label = (Math.hypot(x - D.x0, y - D.y0, z - D.z0)).toFixed(2) + " m";
+  } else {
+    const a = AXES[h.axis];
+    let ang = ringAngle(ray, D.P, a);
+    if (ang == null || D.last == null) {
+      // edge-on: across the screen turns it
+      D.turned = ((D.turnScreen || 0) + (e.clientX - D.cx) * 0.012);
+    } else {
+      let dd = ang - D.last;
+      while (dd > Math.PI) dd -= 2 * Math.PI;
+      while (dd < -Math.PI) dd += 2 * Math.PI;
+      D.turned += dd;
+      D.last = ang;
+      D.turnScreen = D.turned;
+      D.cx = e.clientX;
+    }
+    let t = D.turned;
+    if (S.snapRot) t = snapTo(t, SNAP_R);
+    const rot = D.rot0.slice();
+    if (tilts(it)) {
+      const q0 = new THREE.Quaternion().setFromEuler(new THREE.Euler(rot[0] || 0, rot[1] || 0, rot[2] || 0, "ZYX"));
+      const q = new THREE.Quaternion().setFromAxisAngle(a, t).multiply(q0);
+      const eu = new THREE.Euler().setFromQuaternion(q, "ZYX");
+      rot[0] = Math.abs(eu.x) < 1e-6 ? 0 : eu.x; rot[1] = Math.abs(eu.y) < 1e-6 ? 0 : eu.y; rot[2] = eu.z;
+    } else rot[hi(it)] = (rot[hi(it)] || 0) + sgn(it) * t;
+    p = { x: it.x, y: it.y, z: it.z, rot, on: "" };
+    label = (t >= 0 ? "+" : "") + Math.round(t * 180 / Math.PI) + "°";
+  }
+  D.pose = p;
+  applyPose(p);
+  if (label) gizLabel(label, e); else tip(null);
+}
+function gizLabel(text, e) {
+  const t = S.el.querySelector(".v3d-tip"), r = S.el.getBoundingClientRect();
+  t.textContent = text;
+  t.style.left = (e.clientX - r.left) + "px";
+  t.style.top = (e.clientY - r.top) + "px";
+  t.hidden = false;
+}
+function gizEnd() {
+  const D = S.gdrag;
+  S.gdrag = null;
+  gizHot(null);
+  tip(null);
+  if (D && D.pose) commit(D.pose);
+}
+function setGizMode(m) {
+  if (!S || (m !== "move" && m !== "rotate")) return;
+  S.gizMode = m;
+  try { localStorage.setItem("plotter:v3dgiz", m); } catch (e) { /* private window */ }
+  S.el.querySelectorAll('[data-g="giz"] .btn').forEach(b => b.classList.toggle("on", b.dataset.v === m));
+  gizPlace();
+  help();
+}
+const SNAP_M = 0.5, SNAP_R = Math.PI / 12;   // half a metre, 15 degrees
+
+// Flying: the arrows any time, W A S D while a mouse button is held; Q and E
+// take it down and up then (PageDown, PageUp any time), Shift is faster. The
+// selected thing nudges with Ctrl and the arrows.
+const FLY = { ArrowUp: [0, 1, 0], w: [0, 1, 0], ArrowDown: [0, -1, 0], s: [0, -1, 0],
+  ArrowLeft: [-1, 0, 0], a: [-1, 0, 0], ArrowRight: [1, 0, 0], d: [1, 0, 0],
+  q: [0, 0, -1], PageDown: [0, 0, -1], e: [0, 0, 1], PageUp: [0, 0, 1] };
+const ANYTIME = { ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1, PageUp: 1, PageDown: 1 };
+const held = new Set();
+let fast = false, lastT = 0;
+const vel = new THREE.Vector3();          // the free camera's speed, metres a second
+const wm = { x: 0, y: 0 };                // walking's eased input
+const EASE_IN = 9, GLIDE = 4.2;           // how fast it gets going, and how long it glides
+function flyKey(k) { return FLY[k] ? k : FLY[k.toLowerCase()] ? k.toLowerCase() : null; }
+function fly(now) {
+  const dt = Math.min(0.1, lastT ? (now - lastT) / 1000 : 0);
+  lastT = now;
+  if (!dt) return;
+  let mx = 0, my = 0, mz = 0;
+  held.forEach(k => { const v = FLY[k]; mx += v[0]; my += v[1]; mz += v[2]; });
+  if (S.walking) {
+    const k = 1 - Math.exp(-(mx || my ? EASE_IN : GLIDE * 1.6) * dt);
+    wm.x += (mx - wm.x) * k; wm.y += (my - wm.y) * k;
+    if (!mx && !my && Math.abs(wm.x) < 0.02 && Math.abs(wm.y) < 0.02) { wm.x = wm.y = 0; settle(false, dt); return; }
+    walk(wm.x, wm.y, dt);
+    return;
+  }
+  // forward is where it looks, up and down included, as a spectator flies
+  const f = dirOf(S.yaw, S.pitch), r = new THREE.Vector3(Math.cos(S.yaw), Math.sin(S.yaw), 0);
+  const want = new THREE.Vector3().addScaledVector(f, my).addScaledVector(r, mx);
+  want.z += mz;
+  if (want.lengthSq() > 1) want.normalize();
+  want.multiplyScalar(SPEEDS[S.speed == null ? SPEED_START : S.speed] * (fast ? 3 : 1));
+  vel.lerp(want, 1 - Math.exp(-(want.lengthSq() ? EASE_IN : GLIDE) * dt));
+  if (!want.lengthSq() && vel.lengthSq() < 0.0004) { vel.set(0, 0, 0); return; }
+  S.camera.position.addScaledVector(vel, dt);
+}
+function onKeyUp(e) {
+  const k = flyKey(e.key);
+  if (k) held.delete(k);
+  fast = e.shiftKey;
+}
+function onKey(e) {
+  if (!S || S.el.hidden) return;
+  if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName) && e.target.type !== "range" && e.target.type !== "checkbox") return;
+  const k = e.key, lk = k.length === 1 ? k.toLowerCase() : k, ctrl = e.ctrlKey || e.metaKey, st = e.shiftKey ? 0.5 : e.altKey ? 0.01 : 0.05;
+  let used = true;
+  if (S.film) {
+    // a cutscene playing: its own keys, and nothing flies
+    if (k === " ") filmPlay(!S.film.playing);
+    else if (k === "ArrowLeft") filmStep(-1);
+    else if (k === "ArrowRight") filmStep(1);
+    else if (k === "Home") filmSeek(0);
+    else if (k === "Escape" && !S.film.keepOnEsc) filmStop();
+    else used = false;
+    if (used) { e.preventDefault(); e.stopPropagation(); }
+    return;
+  }
+  fast = e.shiftKey;
+  const flying = S.mouseHeld || !!S.look;
+  if (k === "Escape") {
+    if (document.pointerLockElement === S.canvas) { e.preventDefault(); return; }
+    if (S.gdrag) { const D = S.gdrag; S.gdrag = null; gizHot(null); applyPose({ x: D.x0, y: D.y0, z: D.z0, rot: D.rot0, on: "" }); }
+    else if (S.placing && O.onCancelPlace) O.onCancelPlace();
+    else if (S.addingNode) setAddingNode(false);
+    else if (selected()) deselect();
+    else close();
+  }
+  else if ((k === "Delete" || k === "Backspace") && O.onRemove) { if (selected()) O.onRemove(O.target.key); }
+  else if (ctrl && lk === "c" && O.onCopy) { if (selected()) O.onCopy(O.target.key); }
+  else if (ctrl && lk === "v" && O.onPaste) O.onPaste(aimPoint());
+  else if (ctrl && lk === "d" && O.onDuplicate) { if (selected()) O.onDuplicate(O.target.key, aimPoint()); }
+  else if (ctrl && k === "ArrowLeft") nudge(-st, 0, 0);
+  else if (ctrl && k === "ArrowRight") nudge(st, 0, 0);
+  else if (ctrl && k === "ArrowUp") nudge(0, st, 0);
+  else if (ctrl && k === "ArrowDown") nudge(0, -st, 0);
+  else if (ctrl && k === "PageUp") nudge(0, 0, st);
+  else if (ctrl && k === "PageDown") nudge(0, 0, -st);
+  else if (ctrl) used = false;              // undo, redo and saving belong to the editor
+  else if (flyKey(k) && (flying || ANYTIME[k])) held.add(flyKey(k));
+  // no mouse button held: the gizmo's keys, as in Unreal
+  else if (lk === "w") setGizMode("move");
+  else if (lk === "e") setGizMode("rotate");
+  else if (k === "End") dropToFloor();
+  else if (lk === "t") setView("top");
+  else if (lk === "g") setView(S.walking ? "orbit" : "walk");
+  else if (lk === "f") { if (selected()) setView("orbit"); }
+  else used = false;
+  if (used) { e.preventDefault(); e.stopPropagation(); }
+}
+
+// ------------------------------------------------------------------ an item in hand
+function setPlacing(p) {
+  if (!S || S.dead) return;
+  if (S.ghost) { S.root.remove(S.ghost); S.ghost.traverse(c => { if (c.material) c.material.dispose(); }); S.ghost = null; }
+  S.placing = p || null;
+  if (p) unlock();                        // an item in hand is aimed with the pointer
+  if (p) {
+    const it = Object.assign({ key: "ghost", name: p.label, type: "ghost", x: 0, y: 0, z: 0 }, p);
+    const g = new THREE.Group(), body = new THREE.Group();
+    body.position.z = it.lift || 0;
+    const geo = it.model ? geometryOf(it.model) : null;
+    const mat = new THREE.MeshLambertMaterial({ color: COL.own, transparent: true, opacity: 0.55, depthWrite: false,
+      side: THREE.DoubleSide, flatShading: true });
+    const mesh = new THREE.Mesh(geo || new THREE.BoxGeometry(0.4, 0.4, 1), mat);
+    if (!geo) mesh.position.z = 0.5;
+    mesh.raycast = () => {};
+    body.add(mesh);
+    if (geo && it.gun && it.grip) body.add(gunOf(it, false, mat));
+    g.add(body);
+    g.visible = false;
+    g.userData.item = it;
+    S.ghost = g;
+    S.root.add(g);
+  }
+  if (isOpen()) help();
+}
+function ghostAt(e) {
+  const it = S.ghost.userData.item, h = surfaceFor(e, it);
+  if (!h) { S.ghost.visible = false; return null; }
+  const p = poseFrom(h, e, it);
+  it.x = p.x; it.y = p.y; it.z = p.z; it.rot = p.rot;
+  place(S.ghost, it);
+  S.ghost.visible = true;
+  return p;
+}
+// The keys box: a title for what the view is doing, then one key a line
+function helpRows(title, rows) {
+  const h = S.el.querySelector(".v3d-help");
+  h.querySelector(".v3d-help-title").textContent = title;
+  h.querySelector(".v3d-help-rows").innerHTML = rows.map(r => "<b>" + esc(r[0]) + "</b><span>" + esc(r[1]) + "</span>").join("");
+}
+function help() {
+  const t = O.target, pl = S.placing;
+  hint();
+  if (S.addingNode) {
+    helpRows("Adding walkway points", [["Click", "a floor or the ground: a walkway point there"],
+      ["Drag", "look around"], ["Add walkway point", "again to stop"]]);
+    return;
+  }
+  const move = [["Left-drag", "look around"], ["Right-drag", selected() ? "circle round it" : "circle round the middle of the view"],
+    ["Middle-drag", "pan"], ["Hold a button + W A S D", S.walking ? "walk" : "fly"]]
+    .concat(S.walking ? [] : [["Hold a button + Q E", "down and up"]])
+    .concat([["Arrows", S.walking ? "walk" : "fly, any time"], ["Wheel", "camera speed"], ["Shift", "faster"]]);
+  if (pl) {
+    helpRows("Placing " + pl.label, [
+      ["Click", "put it down " + (pl.kind === "wall" ? "on a wall" : "on a floor, a desk or the ground")],
+      ["Esc", "stop placing"]].concat(move));
+    return;
+  }
+  if (S.walking) {
+    helpRows("Walking", move.concat([["G", "fly again, or pick another view"]]));
+    return;
+  }
+  const edit = [["Click", "select (the ground or the sky: nothing)"]];
+  if (movable()) {
+    edit.push(["W", "move: drag an arrow, a square, or the ball over floors and walls"],
+      ["E", "rotate: drag a ring" + (tilts(t) ? "" : " (about up)")],
+      ["End", "down onto the floor"], ["Ctrl+arrows", "nudge 5 cm"], ["Delete", "remove it"]);
+  }
+  edit.push(["Esc", selected() ? "let go of it, again to close" : "close"]);
+  helpRows("Keys", move.concat(edit));
+}
+
+// ------------------------------------------------------------------ what it stands on
+// the camera has gone well past where the close-up put it: the readout says
+// where you are rather than what the item stands on
+function away() {
+  const p = S.camera.position, t = O.target, o = O.origin;
+  return Math.hypot(p.x - (t.x - o[0]), p.y - (t.y - o[1])) > Math.max(O.radius, S.openD || 0) + 15;
+}
+function youReadout() {
+  const el = S.el.querySelector(".v3d-read"), o = O.origin, p = S.camera.position;
+  const feet = S.walking ? p.z - EYE : p.z, g = groundAt(p.x, p.y);
+  el.innerHTML = `<span class="k">you</span>${(p.x + o[0]).toFixed(1)}, ${(p.y + o[1]).toFixed(1)}, ${(feet + o[2]).toFixed(1)}` +
+    (g != null ? `<br><span class="k">${S.walking ? "ground" : "over"}</span>` +
+      (S.walking ? `${(feet - g) > 0.3 ? (feet - g).toFixed(1) + " m below you" : "under your feet"}` : `${(p.z - g).toFixed(1)} m over the ground`) : "");
+}
+function readout(p) {
+  if (!p && (away() || !selected())) return youReadout();
+  const it = O.target, el = S.el.querySelector(".v3d-read"), o = O.origin;
+  p = p || it;
+  // a building from its base (its foundation goes into the ground), anything else from its lowest point
+  const pos = new THREE.Vector3(p.x - o[0], p.y - o[1], p.z - o[2] +
+    (it.type === "building" ? 0.3 : footOf(it, p.rot || it.rot || [0, 0, 0]) + 0.02));
+  let rows = [];
+  if (it.kind === "wall") {
+    rows.push(`<span class="k">on</span>${esc(p.on || behind(p) || it.on || "nothing behind it")}`);
+    const fl = below(pos, 40, true);
+    if (fl) rows.push(`<span class="k">height</span>${(pos.z - fl.point.z).toFixed(2)} m over ${esc(fl.item.name)}`);
+  } else {
+    const fl = below(pos, 40, it.type === "building");
+    if (fl) {
+      const gap = pos.z - 0.02 - fl.point.z;
+      rows.push(`<span class="k">on</span>${esc(fl.item.name)}` +
+        (Math.abs(gap) > 0.03 ? ` <span class="bad">${gap > 0 ? gap.toFixed(2) + " m above it" : (-gap).toFixed(2) + " m into it"}</span>` : ""));
+    } else rows.push(`<span class="k">on</span><span class="bad">nothing under it</span>`);
+  }
+  rows.push(`<span class="k">at</span>${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`);
+  el.innerHTML = rows.join("<br>");
+}
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+function pickable(it) { return !!it && it.type !== "terrain" && /^(own|ref):/.test(it.key || ""); }
+function tip(it, e) {
+  const t = S.el.querySelector(".v3d-tip");
+  if (!it || it.type === "terrain") { t.hidden = true; return; }
+  const r = S.el.getBoundingClientRect();
+  t.innerHTML = esc(it.name) + (it.key === O.target.key ? (movable() ? " <i>selected - drag the gizmo</i>" : selected() ? "" : " <i>click to select</i>") :
+    pickable(it) ? " <i>click to select</i>" : "");
+  t.style.left = (e.clientX - r.left) + "px";
+  t.style.top = (e.clientY - r.top) + "px";
+  t.hidden = false;
+}
+
+// ------------------------------------------------------------------ a cutscene, played
+// View3D.film(F) plays a cutscene's cameras in the close-up as the game plays
+// them (studio/extract/motion.py reads them from a level; a mission's own come
+// from the editor):
+//   F.shots      [{name, scene, x, y, z, a, b, g, fov, dur, smooth, target, filter, shake, lb, end}]
+//                in game metres. In order: one with smooth moves to the next one
+//                over its dur (seconds); one without holds for its dur, then cuts.
+//                Angles are the game's: alpha about x, beta about y, gamma about z,
+//                the camera looking up (+z) with its top to the south at zero - so
+//                alpha -pi/2 looks level along gamma's heading, -pi straight down.
+//                target {x, y, z}: the camera keeps turning to look at it.
+//                ride {key, x, y, z, g}: the camera rides with that mover (as the
+//                game's camera linked to a vehicle), set up with it standing at
+//                x, y, z turned g; camera and target go where it goes.
+//                lb: its scene's letterbox; end: the last of its scene (no move on).
+//   F.subtitles  [{at, dur, text}], seconds from the start
+//   F.letterbox  the game's viewport height factor (0.7: a bar above and below)
+//   F.note       a line under the controls (what the preview cannot show)
+//   F.start      where to begin, seconds
+//   F.far        the ground beyond the close-up's ({x0, y0, cell, w, h, z, hole}),
+//                drawn round it while the cutscene plays
+//   F.movers(t)  what moves at t seconds: [{key, x, y, z, h}] - a patrolling
+//                guard, a vehicle driving its route; h the heading from +x, z
+//                null for on the ground. Each goes back where it stands after.
+// A helicopter's rotors turn while it plays, if it is off the ground.
+//   F.onEnd()    stopped (Esc, Stop, or the view closed)
+// While it plays there is no fog and the camera sees as far as the level goes:
+// the host gives the whole level at once (explore).
+// The mouse is not taken while it plays; Space pauses, the arrows go a shot back
+// or on, Esc stops it and leaves the camera where it is.
+const FILM_FOV = 60;                // degrees, the view at the game's FOV factor 1
+function film(F) {
+  if (!S || S.dead || !isOpen()) return false;
+  unlock();
+  vel.set(0, 0, 0);
+  held.clear();
+  const shots = (F.shots || []).filter(x => isFinite(x.x) && isFinite(x.y) && isFinite(x.z));
+  if (!shots.length) return false;
+  if (S.film) filmUnmove(S.film);           // played again (the editor's changes): from where they stand
+  const at = [];
+  let t = 0;
+  shots.forEach(x => { at.push(t); t += Math.max(0, +x.dur || 0); });
+  S.film = { shots, at, total: t, t: Math.max(0, Math.min(t, +F.start || 0)), playing: F.paused ? false : true, last: 0,
+    subs: (F.subtitles || []).slice().sort((p, q) => p.at - q.at), lb: Math.max(0.2, Math.min(1, F.letterbox || 1)),
+    onEnd: F.onEnd || null, movers: typeof F.movers === "function" ? F.movers : null, moved: new Set(), pose: {} };
+  // everything visible: no fog, the camera's far plane past the level's edge
+  S.scene.fog = null;
+  S.camera.far = 40000;
+  if (S.farMesh) { S.root.remove(S.farMesh); drop(S.farMesh); S.farMesh = null; }
+  if (F.far) { S.farMesh = terrainMesh(F.far); S.farMesh.userData.item = { key: "farground", name: "the ground", type: "terrain" }; S.root.add(S.farMesh); }
+  const el = S.el.querySelector(".v3d-film");
+  el.hidden = false;
+  el.style.top = S.canvas.offsetTop + "px";
+  el.querySelector(".note").textContent = F.note || "";
+  // a host with its own controls (the cutscene editor) hides the film's
+  el.classList.toggle("bare", !!F.bare);
+  S.film.keepOnEsc = !!F.keepOnEsc;
+  S.el.classList.add("filming");
+  if (!el.dataset.wired) {
+    el.dataset.wired = "1";
+    el.querySelector(".v3d-fplay").addEventListener("click", () => filmPlay(!(S.film && S.film.playing)));
+    el.querySelector(".v3d-fprev").addEventListener("click", () => filmStep(-1));
+    el.querySelector(".v3d-fnext").addEventListener("click", () => filmStep(1));
+    el.querySelector(".v3d-fstop").addEventListener("click", filmStop);
+    const seek = el.querySelector(".v3d-fseek");
+    seek.addEventListener("input", () => { if (S.film) { S.film.playing = false; filmSeek(+seek.value / 1000 * S.film.total); } });
+  }
+  S.exploredAt = -1e9;
+  filmLayout();
+  filmApply();
+  filmUi();
+  hint();
+  return true;
+}
+function filmLayout() {
+  const F = S.film, el = S.el.querySelector(".v3d-film");
+  const h = S.canvas.clientHeight, bar = Math.round(h * (1 - F.lb) / 2);
+  F.h = h;
+  el.style.top = S.canvas.offsetTop + "px";
+  el.querySelector(".bar.t").style.height = bar + "px";
+  el.querySelector(".bar.b").style.height = bar + "px";
+  el.querySelector(".subt").style.bottom = bar ? Math.max(4, Math.round(bar * 0.3)) + "px" : "6%";
+}
+function filmIndex(t) {
+  const F = S.film;
+  for (let k = 0; k < F.shots.length; k++) if (F.shots[k].dur > 0 && t < F.at[k] + F.shots[k].dur) return k;
+  for (let k = F.shots.length - 1; k >= 0; k--) if (F.shots[k].dur > 0) return k;
+  return F.shots.length - 1;
+}
+const _e = new THREE.Euler(), _q = new THREE.Quaternion();
+function turnOf(a, b, g) {
+  _q.setFromEuler(_e.set(a || 0, b || 0, g || 0, "ZYX"));
+  return { fwd: new THREE.Vector3(0, 0, 1).applyQuaternion(_q), up: new THREE.Vector3(0, -1, 0).applyQuaternion(_q) };
+}
+function filmApply() {
+  filmMove();
+  const F = S.film, o = O.origin, i = filmIndex(F.t), s = F.shots[i];
+  // the last camera of a scene ends it: the next scene cuts to its own first
+  const n = s.smooth && s.dur > 0 && !s.end ? F.shots[i + 1] : null;
+  if (s.lb && s.lb !== F.lb) { F.lb = s.lb; filmLayout(); }
+  const u = n ? Math.max(0, Math.min(1, (F.t - F.at[i]) / s.dur)) : 0;
+  const L = (p, q) => p + (q - p) * u;
+  const A = (p, q) => p + ((((q - p + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) - Math.PI) * u;
+  const pos = new THREE.Vector3(n ? L(s.x, n.x) : s.x, n ? L(s.y, n.y) : s.y, n ? L(s.z, n.z) : s.z).sub(new THREE.Vector3(o[0], o[1], o[2]));
+  let fwd, up;
+  let tg = s.target || null;
+  const rd = s.ride && F.pose[s.ride.key];
+  if (rd) {
+    // where the vehicle is now, turned as it is turned now
+    const r = s.ride, d = (rd.h - Math.PI / 2) - r.g, c = Math.cos(d), sn = Math.sin(d);
+    const ox = pos.x + o[0] - r.x, oy = pos.y + o[1] - r.y;
+    pos.set(rd.x + ox * c - oy * sn - o[0], rd.y + ox * sn + oy * c - o[1], pos.z + rd.z - r.z);
+    if (tg) tg = { x: tg.x + rd.x - r.x, y: tg.y + rd.y - r.y, z: tg.z + rd.z - r.z };
+  }
+  if (tg) {
+    fwd = new THREE.Vector3(tg.x - o[0], tg.y - o[1], tg.z - o[2]).sub(pos);
+    if (fwd.lengthSq() < 1e-6) fwd.set(0, 1, 0);
+    fwd.normalize();
+    up = new THREE.Vector3(0, 0, 1);
+  } else {
+    const r = turnOf(n ? A(s.a, n.a) : s.a, n ? A(s.b, n.b) : s.b, n ? A(s.g, n.g) : s.g);
+    fwd = r.fwd; up = r.up;
+  }
+  const shake = n ? L(s.shake || 0, n.shake || 0) : (s.shake || 0);
+  if (shake > 0) {
+    // a hand-held camera: a small wander, the same each time it is played
+    const w = F.t * 9;
+    fwd.add(new THREE.Vector3(Math.sin(w * 1.3), Math.sin(w * 1.7 + 1), Math.sin(w * 1.1 + 2)).multiplyScalar(shake * 1.5)).normalize();
+  }
+  S.camera.position.copy(pos);
+  S.camera.up.copy(up);
+  S.camera.lookAt(pos.clone().add(fwd));
+  S.camera.fov = Math.max(4, Math.min(120, FILM_FOV * (n ? L(s.fov || 1, n.fov || 1) : (s.fov || 1))));
+  S.camera.updateProjectionMatrix();
+  S.yaw = Math.atan2(-fwd.x, fwd.y);
+  S.pitch = Math.atan2(fwd.z, Math.hypot(fwd.x, fwd.y));
+  fogFor();
+  const el = S.el.querySelector(".v3d-film");
+  const sub = F.subs.find(x => F.t >= x.at && F.t < x.at + Math.max(0.5, x.dur || 0));
+  const st = el.querySelector(".subt"), txt = sub ? sub.text || "" : "";
+  if (st.textContent !== txt) st.textContent = txt;
+  const fx = "fx " + (s.filter || "");
+  if (F.fx !== fx) { F.fx = fx; el.querySelector(".fx").className = fx; }
+  F.shot = i;
+}
+// where everything that moves is at the film's time: the guards on their
+// patrols, the vehicles on their routes, the rotors of a helicopter in the air
+function filmMove() {
+  const F = S.film, o = O.origin;
+  if (F.movers) {
+    let list = [];
+    try { list = F.movers(F.t) || []; } catch (e) { list = []; }
+    for (const m of list) {
+      const g = S.byKey.get(m.key), it = g && g.userData.item;
+      if (!it || !isFinite(m.x) || !isFinite(m.y)) continue;
+      const x = m.x - o[0], y = m.y - o[1], gz = m.z == null ? groundAt(x, y) : null;
+      g.position.set(x, y, m.z != null ? m.z - o[2] : gz != null ? gz : it.z - o[2]);
+      const rot = (it.rot || [0, 0, it.gamma || 0]).slice();
+      // the game's heading is from +y (the map's arrow up), the mover's from +x
+      rot[hi(it)] = (it.headOff || 0) + sgn(it) * ((m.h || 0) - Math.PI / 2);
+      orient(g, rot);
+      g.userData.box = null;
+      F.moved.add(m.key);
+      F.pose[m.key] = { x: m.x, y: m.y, z: g.position.z + o[2], h: m.h || 0 };
+    }
+  }
+  if (!S.spinning || !S.spinning.length) return;
+  S.spinning = S.spinning.filter(p => { let q = p; while (q && q !== S.root) q = q.parent; return !!q; });
+  for (const p of S.spinning) {
+    const sp = p.userData.spin, g = S.byKey.get(sp.item.key);
+    if (!g) continue;
+    const gz = groundAt(g.position.x, g.position.y);
+    const up = sp.item.flies || gz == null || g.position.z - gz > 1.5;
+    p.quaternion.setFromAxisAngle(sp.axis, up ? (F.t * sp.rate % 1) * Math.PI * 2 : 0);
+  }
+}
+// everything the film moved back where it stands, its rotors still
+function filmUnmove(F) {
+  for (const k of F.moved) { const g = S.byKey.get(k); if (g) place(g, g.userData.item); }
+  F.moved.clear();
+  for (const p of S.spinning || []) p.quaternion.identity();
+}
+function filmUi() {
+  const F = S.film, el = S.el.querySelector(".v3d-film");
+  if (!F) return;
+  const i = F.shot != null ? F.shot : filmIndex(F.t), s = F.shots[i];
+  el.querySelector(".v3d-fplay").textContent = F.playing ? "Pause" : F.t >= F.total ? "Again" : "Play";
+  el.querySelector(".ft").textContent = F.t.toFixed(1) + " / " + F.total.toFixed(1) + " s";
+  el.querySelector(".fs").textContent = (s.scene ? s.scene + " · " : "") + (s.name || "shot " + (i + 1));
+  el.querySelector(".v3d-fseek").value = F.total ? Math.round(F.t / F.total * 1000) : 0;
+}
+function filmTick(now) {
+  const F = S.film;
+  const dt = F.last ? Math.min(0.1, (now - F.last) / 1000) : 0;
+  F.last = now;
+  if (F.playing) {
+    F.t += dt;
+    if (F.t >= F.total) { F.t = F.total; F.playing = false; }
+  }
+  if (S.canvas.clientHeight !== F.h) filmLayout();
+  filmApply();
+  if (now - (F.uiAt || 0) > 100 || !F.playing) { F.uiAt = now; filmUi(); }
+}
+function filmPlay(on) {
+  const F = S && S.film;
+  if (!F) return;
+  if (on && F.t >= F.total) F.t = 0;
+  F.playing = !!on;
+  F.last = 0;
+  filmUi();
+}
+function filmSeek(t) {
+  const F = S && S.film;
+  if (!F) return;
+  F.t = Math.max(0, Math.min(F.total, t));
+  S.exploredAt = -1e9;
+  filmApply();
+  filmUi();
+}
+// a shot back or on: back to the start of this one (or the one before, at its
+// start already), or on to the next one that takes time
+function filmStep(d) {
+  const F = S && S.film;
+  if (!F) return;
+  const i = filmIndex(F.t);
+  let k = i;
+  if (d < 0 && F.t - F.at[i] > 0.6) k = i;
+  else {
+    k += d;
+    while (k > 0 && k < F.shots.length - 1 && !(F.shots[k].dur > 0)) k += d;
+  }
+  k = Math.max(0, Math.min(F.shots.length - 1, k));
+  filmSeek(F.at[k] + 0.001);
+}
+function filmStop() {
+  if (!S || !S.film) return;
+  const cb = S.film.onEnd;
+  filmUnmove(S.film);
+  S.film = null;
+  S.el.querySelector(".v3d-film").hidden = true;
+  S.el.classList.remove("filming");
+  S.camera.up.set(0, 0, 1);
+  S.camera.fov = 60;
+  S.camera.far = 3000;
+  S.camera.updateProjectionMatrix();
+  if (S.farMesh) { S.root.remove(S.farMesh); drop(S.farMesh); S.farMesh = null; }
+  S.scene.fog = new THREE.Fog(0x9fb2ba, 1, 2);
+  applyLook();
+  fogFor();
+  hint();
+  if (cb) cb();
+}
+
+// ------------------------------------------------------------------ the loop
+function resize() {
+  const c = S.canvas, w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  if (w !== S.size[0] || h !== S.size[1]) {
+    S.size = [w, h];
+    S.renderer.setSize(w, h, false);
+    S.camera.aspect = w / h;
+    S.camera.updateProjectionMatrix();
+  }
+}
+function loop() {
+  if (!S || S.el.hidden) { S && (S.raf = 0); return; }
+  resize();
+  const now = performance.now();
+  if (S.film) filmTick(now); else fly(now);
+  explore(now);
+  S.renderer.render(S.scene, S.camera);
+  gizPlace();
+  if (S.giz && S.giz.g.visible) {
+    S.renderer.autoClear = false;
+    S.renderer.clearDepth();
+    S.renderer.render(S.giz.scene, S.camera);
+    S.renderer.autoClear = true;
+  }
+  minimap(now);
+  S.raf = requestAnimationFrame(loop);
+}
+
+// ------------------------------------------------------------------ the map in the corner
+// The map computer round where you are, north up: you as the player's own mark,
+// turned the way you look, with the view's cone. The map is drawn by the editor
+// (O.mapImage) as one patch MINI_SNAP metres across; the corner shows MINI_M of
+// it, and a new patch is drawn only when you have flown well away from the
+// middle of this one, or the mission has changed since it was drawn.
+const MINI_M = 240, MINI_SNAP = 640, MINI_PX = 800;
+function minimap(now) {
+  const cv = S.el.querySelector(".v3d-mini");
+  if (!O || !O.mapImage) { cv.hidden = true; return; }
+  const top = S.el.querySelector(".v3d-top").offsetHeight + 10;
+  if (top !== S.miniTop) { S.miniTop = top; cv.style.top = top + "px"; }
+  const p = S.camera.position, x = p.x + O.origin[0], y = p.y + O.origin[1];
+  const m0 = S.mini;
+  const far = !m0 || Math.hypot(x - m0.cx, y - m0.cy) > MINI_SNAP * 0.28;
+  if ((far || (S.miniStale && now - m0.at > 1500)) && now - (S.miniTried || 0) > 400) {
+    S.miniTried = now;
+    const img = O.mapImage(x, y, MINI_SNAP, MINI_PX);
+    if (img) { S.mini = { img, cx: x, cy: y, at: now }; S.miniStale = false; }
+  }
+  const m = S.mini;
+  if (!m) { cv.hidden = true; return; }
+  cv.hidden = false;
+  const d = S.miniDrawn;
+  if (d && d[0] === x && d[1] === y && d[2] === S.yaw && d[3] === m) return;
+  S.miniDrawn = [x, y, S.yaw, m];
+  const dpr = Math.min(window.devicePixelRatio || 1, 2), w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  // the part of the patch round you: the patch has MINI_PX / MINI_SNAP pixels a metre
+  const s = MINI_PX / MINI_SNAP, half = MINI_M * s / 2;
+  g.drawImage(m.img, (x - m.cx) * s + MINI_PX / 2 - half, (m.cy - y) * s + MINI_PX / 2 - half, half * 2, half * 2, 0, 0, w, h);
+  const css = n => getComputedStyle(S.el).getPropertyValue(n).trim();
+  const you = css("--accent") || "#ffd24a", k = w / MINI_M;
+  // what the camera sees: its cone out to 60 m
+  const hf = 2 * Math.atan(Math.tan(S.camera.fov * Math.PI / 360) * S.camera.aspect), r = 60 * k;
+  g.save();
+  g.translate(w / 2, h / 2);
+  g.rotate(-S.yaw);
+  g.beginPath();
+  g.moveTo(0, 0);
+  g.arc(0, 0, r, -Math.PI / 2 - hf / 2, -Math.PI / 2 + hf / 2);
+  g.closePath();
+  g.fillStyle = "rgba(255,210,74,.16)";
+  g.strokeStyle = "rgba(255,210,74,.55)";
+  g.lineWidth = 1;
+  g.fill();
+  g.stroke();
+  g.restore();
+  // you, as the map shows the player
+  if (window.PlanIcons) {
+    g.save();
+    g.translate(w / 2, h / 2);
+    g.fillStyle = you;
+    g.strokeStyle = "#fff3c4";
+    g.shadowColor = "rgba(0,0,0,.75)";      // a dark halo, so it stands out on any ground
+    g.shadowBlur = 4;
+    window.PlanIcons.draw(g, "player", 11, S.yaw, { fillAlpha: 1, line: 1 });
+    g.restore();
+  }
+  // north, and how far across
+  g.font = '600 10px "IBM Plex Mono",monospace';
+  g.fillStyle = "rgba(141,255,154,.85)";
+  g.textAlign = "center";
+  g.fillText("N", w / 2, 12);
+  g.textAlign = "left";
+  g.fillText(MINI_M + " m", 6, h - 6);
+}
+
+// ------------------------------------------------------------------ the API
+function open(opts) {
+  const keep = S && !S.el.hidden && opts.keepView;
+  const camState = keep ? { p: S.camera.position.clone(), yaw: S.yaw, pitch: S.pitch, o: O.origin } : null;
+  O = opts;
+  O.origin = [opts.target.x, opts.target.y, opts.target.z];
+  if (S) S.noSel = false;              // what it was opened on (or picked) is the one selected
+  if (S) { S.centre = [O.origin[0], O.origin[1]]; S.exploredAt = 0; S.cutFreed = false; }
+  if (!S) { S = build(opts.host); S.centre = [O.origin[0], O.origin[1]]; }
+  S.miniStale = true;                 // the mission may have changed: the corner's map is drawn again soon
+  if (S.dead) { S.el.hidden = false; return; }
+  if (S.el.parentNode !== opts.host) opts.host.appendChild(S.el);
+  S.el.hidden = false;
+  S.el.querySelector(".v3d-title").textContent = opts.target.name || "Item";
+  S.el.querySelector(".v3d-sub").textContent = opts.target.sub ? opts.target.sub : opts.target.editable ?
+    (opts.target.kind === "wall" ? "hangs on walls" : opts.target.kind === "fixed" ? "stays where it is" : "stands on floors") :
+    "the level's own - not movable";
+  const rad = S.el.querySelector(".v3d-rad");
+  rad.value = opts.radius;
+  S.el.querySelector(".v3d-radv").textContent = rad.value + " m";
+  const camBtn = S.el.querySelector('[data-g="view"] [data-v="cam"]');
+  camBtn.hidden = !opts.target.cam;
+  const holding = S.placing;
+  fill();
+  S.ghost = null;
+  setPlacing(holding);
+  help();
+  const cutEl = S.el.querySelector(".v3d-cut");
+  if (!keep) {
+    // inside a building: cut just below the ceiling over it, so the room is open
+    // (outdoors nothing is cut - not a dome's overhang, not a tree)
+    setCut(100);
+    const top = opts.inside ? ceiling() : null;
+    const h = top != null ? top - 0.08 : opts.inside ? 2.6 : null;
+    const v = h == null ? 100 : Math.max(0, Math.min(99, Math.round((h + 1) / 13 * 99)));
+    cutEl.value = v;
+    setCut(v);
+    if (v < 100) S.cut.constant = h;       // exactly under the ceiling, not the slider's step
+    S.el.querySelector(".v3d-xray").checked = false;
+  }
+  setXray(S.el.querySelector(".v3d-xray").checked);
+  if (camState) {
+    // the same view of the world, from the new origin
+    const d = new THREE.Vector3(camState.o[0] - O.origin[0], camState.o[1] - O.origin[1], camState.o[2] - O.origin[2]);
+    S.camera.position.copy(camState.p.add(d));
+    S.yaw = camState.yaw;
+    S.pitch = camState.pitch;
+    applyLook();
+  } else setView(opts.view || "orbit");
+  S.openD = Math.hypot(S.camera.position.x - (opts.target.x - O.origin[0]), S.camera.position.y - (opts.target.y - O.origin[1]));
+  readout();
+  if (!S.raf) S.raf = requestAnimationFrame(loop);
+  S.canvas.focus();
+  // opened fresh (a click, so the browser allows it): the mouse is the view's
+  if (!keep) vel.set(0, 0, 0);
+  hint();
+}
+function close() {
+  if (!S) return;
+  if (S.film) filmStop();
+  unlock();
+  S.el.hidden = true;
+  S.drag = null;
+  S.gdrag = null;
+  S.look = null;
+  const cb = O && O.onClose;
+  if (cb) cb();
+}
+function isOpen() { return !!S && !S.el.hidden && !S.dead; }
+// The plan changed outside the close-up: the panel turned or moved something,
+// undo, what rests on a moved crate came along. The same scene, brought up to
+// date and seen from where you are: what only moved or turned is moved, what
+// looks different is made again, what is gone goes.
+const LOOK = ["model", "type", "own", "solid", "lift", "cam", "name"];
+function update(opts) {
+  if (!isOpen() || !O || S.drag || S.gdrag) return;
+  if (opts.target && opts.target.key !== O.target.key) return;
+  if (opts.target) Object.assign(O.target, opts.target);
+  const next = new Map((opts.objects || []).map(it => [it.key, it]));
+  const same = (a, b) => LOOK.every(k => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+  for (const [k, g] of S.byKey) {
+    if (next.has(k)) continue;
+    S.root.remove(g); drop(g); S.byKey.delete(k);
+    S.items.splice(S.items.indexOf(g), 1);
+  }
+  for (const it of next.values()) {
+    const g = S.byKey.get(it.key);
+    if (g && same(g.userData.item, it)) {
+      Object.assign(g.userData.item, it);      // the meshes share this object
+      place(g, g.userData.item);
+      g.userData.box = null;
+      continue;
+    }
+    if (g) { S.root.remove(g); drop(g); S.items.splice(S.items.indexOf(g), 1); }
+    const n = makeItem(it);
+    S.root.add(n); S.items.push(n); S.byKey.set(it.key, n);
+  }
+  S.target = S.byKey.get(O.target.key) || null;
+  if (S.el.querySelector(".v3d-xray").checked) setXray(true);
+  if ("nav" in opts) { O.nav = opts.nav; makeNav(); }
+  readout();
+}
+function follow(pose) {
+  if (!isOpen() || !O) return;
+  const it = O.target;
+  Object.assign(it, pose);
+  if (S.target) place(S.target, it);
+  readout();
+}
+
+// where a point of the world is on the screen (client pixels) - for the tests
+function screenOf(x, y, z) {
+  if (!isOpen()) return null;
+  const o = O.origin, v = new THREE.Vector3(x - o[0], y - o[1], z - o[2]).project(S.camera);
+  const r = S.canvas.getBoundingClientRect();
+  return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height];
+}
+
+// the view as it is now, without the gizmo: a picture for a mission's cover
+function capture() {
+  if (!isOpen()) return null;
+  resize();
+  S.renderer.render(S.scene, S.camera);
+  return S.canvas.toDataURL("image/png");      // read before the frame is handed on, so it is still there
+}
+
+window.View3D = { open, close, isOpen, follow, update, screenOf, setPlacing, prepare, target: () => O && O.target,
+  film, filmStop, filmSeek, filmPlay, capture,
+  // for the tests: the gizmo, and where on screen a point of a handle is (move:
+  // along the arrow, 0..1; rotate: round the ring, an angle)
+  gizmo: () => S && S.giz ? { shown: gizShown(), mode: S.gizMode, selected: selected(), speed: S.speed,
+    scale: +S.giz.g.scale.x.toFixed(3), dragging: !!S.gdrag } : null,
+  gizPick: (x, y) => { const g = S && gizHit({ clientX: x, clientY: y }); return g ? g.handle.kind + ":" + g.handle.axis : null; },
+  handleAt: (kind, axis, f) => {
+    if (!gizShown()) return null;
+    gizPlace();
+    const G = S.giz, s = G.g.scale.x, P = G.g.position.clone(), v = new THREE.Vector3();
+    if (kind === "move" && axis === "free") v.set(0, 0, 0);
+    else if (kind === "move" && axis.length === 1) v.copy(AXES[axis]).multiplyScalar((f == null ? 0.6 : f) * s);
+    else if (kind === "move") { v.set(0, 0, 0); for (const c of axis) v.add(AXES[c].clone().multiplyScalar(0.22 * s)); }
+    else {
+      const a = AXES[axis], [u1, u2] = ringBasis(a), c = S.camera.position.clone().sub(P);
+      const t = Math.atan2(c.dot(u2), c.dot(u1)) + (f || 0);      // f: radians either side of the middle of the half
+      v.copy(u1).multiplyScalar(Math.cos(t) * 0.8 * s).addScaledVector(u2, Math.sin(t) * 0.8 * s);
+    }
+    const w = P.add(v).project(S.camera), r = S.canvas.getBoundingClientRect();
+    return [r.left + (w.x + 1) / 2 * r.width, r.top + (1 - w.y) / 2 * r.height];
+  },
+  // for the tests: where a cutscene is, and the camera
+  filmState: () => S && S.film ? { t: S.film.t, total: S.film.total, shot: S.film.shot, playing: S.film.playing,
+    subtitle: S.el.querySelector(".v3d-film .subt").textContent, fov: S.camera.fov,
+    cam: S.camera.position.toArray().map((v, i) => +(v + O.origin[i]).toFixed(2)), yaw: +S.yaw.toFixed(3), pitch: +S.pitch.toFixed(3) } : null,
+  cam: () => S ? [S.camera.position.x, S.camera.position.y, S.camera.position.z] : null,
+  walking: () => !!(S && S.walking), navCount: () => (S && S.nav ? S.nav.children.length : 0),
+  // what a step forward meets - for the tests
+  walkProbe: () => {
+    if (!S) return null;
+    const p = S.camera.position, f = new THREE.Vector3(-Math.sin(S.yaw), Math.cos(S.yaw), 0), out = [];
+    for (const up of [STEP_UP + 0.1, 1.1, 1.6]) {
+      S.ray.set(new THREE.Vector3(p.x, p.y, p.z - EYE + up), f); S.ray.far = 0.65;
+      out.push(hits(S.ray, false).map(q => q.item.name + " nz " + q.normal.z.toFixed(2) + " d " + q.dist.toFixed(2)).join("; "));
+      S.ray.far = Infinity;
+    }
+    return { floor: floorAt(p.x + f.x * 0.35, p.y + f.y * 0.35, p.z - EYE + STEP_UP + 0.02), eye: p.z, rays: out };
+  },
+  look: () => S ? [S.yaw, S.pitch] : null,
+  // for the tests: the camera at a world point, looking at another
+  lookFrom: (x, y, z, tx, ty, tz) => {
+    if (!S) return; const o = O.origin;
+    S.camera.position.set(x - o[0], y - o[1], z - o[2]); S.exploredAt = -1e9; explore(performance.now());
+    lookAt(new THREE.Vector3(tx - o[0], ty - o[1], tz - o[2]));
+  },
+  // for the tests: the camera at a point of the world, what is loaded round it
+  goTo: (x, y, z) => { if (!S) return; const o = O.origin; S.camera.position.set(x - o[0], y - o[1], z - o[2]); S.exploredAt = -1e9; explore(performance.now()); },
+  loaded: () => S ? { items: S.items.length, centre: S.centre, splines: (O.splines || []).length, splineMeshes: S.splines ? S.splines.children.length : 0, terrain: O.terrain ? [O.terrain.x0, O.terrain.y0, O.terrain.w, O.terrain.h] : null,
+    keys: S.items.map(g => g.userData.item.name) } : null,
+  // for the tests: the camera d metres from an item, from the side at angle a
+  // (0 = north of it), a little above its middle, looking at it
+  closeTo: (k, d, a) => {
+    const g = S && S.byKey.get(k);
+    if (!g) return false;
+    const c = new THREE.Box3().setFromObject(g).getCenter(new THREE.Vector3());
+    S.camera.position.set(c.x - Math.sin(a) * d, c.y + Math.cos(a) * d, c.z + d * 0.25);
+    lookAt(c);
+    return true;
+  },
+  // how an item is drawn now: position and turn - for the tests
+  shown: k => { const g = S && S.byKey.get(k); return g ? { p: g.position.toArray().map(v => +v.toFixed(3)),
+    r: [g.rotation.x, g.rotation.y, g.rotation.z].map(v => +v.toFixed(3)) } : null; },
+  // for the tests: fly for so many milliseconds with the keys held now
+  flyFor: ms => { const t0 = performance.now(); lastT = t0; fly(t0 + ms); S.exploredAt = -1e9; explore(t0 + ms); },
+  // what is under a screen point - for the tests
+  probe: (x, y) => { const h = isOpen() ? cast({ clientX: x, clientY: y }, false)[0] : null;
+    return h ? { name: h.item.name, key: h.item.key, type: h.item.type, nz: +h.normal.z.toFixed(2) } : null; } };
+window.dispatchEvent(new Event("view3d-ready"));

@@ -1,0 +1,5 @@
+owner: NaumanHSA
+repo: project-igi-studio
+provider: github
+releaseType: release
+updaterCacheDirName: project-igi-studio-updater
