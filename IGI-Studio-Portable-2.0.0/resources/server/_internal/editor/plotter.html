@@ -17891,8 +17891,52 @@ var AIB=(function(){
     return it;
   }
 
+  // ---------------------------------------------------------------- high-level programmatic Editor API
+  window.Editor = {
+    spawnGuard: function(opts){ return H.place_guards(opts || {}); },
+    spawnObject: function(opts){ return H.place_object(opts || {}); },
+    spawnPickup: function(opts){ return H.place_pickup(opts || {}); },
+    spawnCamera: function(opts){ return H.place_camera(opts || {}); },
+    spawnAlarm: function(opts){ return H.place_alarm_part(opts || {}); },
+    addWalkways: function(points){ return H.add_walkways({points: points}); },
+    addObjective: function(opts){ return H.add_objective(opts || {}); },
+    addEvent: function(opts){ return H.add_event(opts || {}); },
+    setSettings: function(opts){ return H.set_settings(opts || {}); },
+    setPlayerStart: function(x, y, facing){ return H.set_player_start({x: x, y: y, facing_deg: facing}); },
+    remove: function(id){ return H.remove_item({id: id}); },
+    select: function(id){
+      var o = AIB.byId(id);
+      if(o){ sel = o; multi = []; renderSide(); draw(); return {ok: true, selected: id}; }
+      return {ok: false, error: "Item not found: " + id};
+    },
+    jump: function(x, y, zoom){ jumpTo(x, y, zoom || Math.max(view.k, 2.6)); draw(); return {ok: true, at: {x: x, y: y}}; },
+    getPlacements: function(){ return placements.slice(); },
+    getState: function(){ return planState(); },
+    redraw: function(){ changed(); return true; }
+  };
+
   // ---------------------------------------------------------------- looking
   var H={};
+  H.run_editor_code=function(a){
+    if(!a||!a.code)return fail("Provide 'code' string to execute.");
+    try{
+      var fn=new Function("Editor","placements","LEVEL","M","objectives","events","jumpTo","draw","changed","fail",a.code);
+      var res=fn.call(window,window.Editor,placements,LEVEL,M,objectives,events,jumpTo,draw,changed,fail);
+      changed();
+      return {ok:true,result:res!==undefined?res:"Executed successfully.",total_placements:placements.length,total_objectives:objectives.length,total_events:events.length};
+    }catch(err){
+      return fail("Editor execution error: "+(err&&err.message?err.message:String(err)));
+    }
+  };
+  H.capture_screen=function(a){
+    try{
+      var snap=captureMap();
+      if(!snap)return fail("Editor canvas is not ready.");
+      return {ok:true,bounds:snap.bounds,grid_spacing_m:snap.grid,width:snap.w,height:snap.h,url:snap.url.slice(0,100)+"... [captured data URL]",note:"Visual map captured with coordinate grid in meters."};
+    }catch(err){
+      return fail("Failed to capture screen: "+err);
+    }
+  };
   H.get_overview=function(){
     if(editable()&&!objBase)seedObjectives();
     var b=playBounds(),bi=builtin(LV)||{},L=levelThings(),pl=playerObj(),cnt={},mine={};
@@ -18914,13 +18958,15 @@ var AIB=(function(){
       labels:{type:"array",items:{type:"object",properties:{id:{type:"string"},title:{type:"string"},info:{type:"string"}},required:["id","title"]}}})},
     {name:"list_missions",look:true,description:"The user's missions in the library: ids, names, levels, descriptions.",parameters:P({})},
     {name:"make_versions",description:"Make easy, normal and hard copies of this mission in the user's library: easy has a third fewer of the mission's guards, less sight, more time, no fail on alarm, a medipack by the start; hard one more guard for every two, more sight, less time, fail on alarm, fewer medipacks. This mission stays as it is.",parameters:P({versions:{type:"array",items:{type:"string",enum:["easy","normal","hard"]}}})},
-    {name:"make_campaign",look:true,description:"Put several of the user's missions (ids from list_missions) in order under a campaign name and briefing: opens the campaign sheet for the user to check and export as one file.",parameters:P({name:{type:"string"},briefing:{type:"string"},mission_ids:{type:"array",items:{type:"string"}}},["name","mission_ids"])}
+    {name:"make_campaign",look:true,description:"Put several of the user's missions (ids from list_missions) in order under a campaign name and briefing: opens the campaign sheet for the user to check and export as one file.",parameters:P({name:{type:"string"},briefing:{type:"string"},mission_ids:{type:"array",items:{type:"string"}}},["name","mission_ids"])},
+    {name:"run_editor_code",description:"Execute arbitrary JavaScript directly inside the editor window to control everything programmatically. Full access to window.Editor (Editor.spawnGuard, Editor.spawnObject, Editor.spawnPickup, Editor.spawnCamera, Editor.spawnAlarm, Editor.addWalkways, Editor.addObjective, Editor.addEvent, Editor.setSettings, Editor.setPlayerStart, Editor.remove, Editor.select, Editor.jump, Editor.getPlacements, Editor.getState, Editor.redraw), placements, LEVEL, M, objectives, events. Return any value or string to inspect it.",parameters:P({code:{type:"string",description:"JavaScript code to execute in editor scope."}},["code"])},
+    {name:"capture_screen",look:true,description:"Capture a visual snapshot of the editor map and viewport with coordinate grid lines to see the visual layout of the level.",parameters:P({})}
   ];
   // Each tool has a kind, and each agent of the AI designer (editor/ai.js) the
   // kinds it may use: look and design change nothing in the mission; build,
   // ground and texts do; library makes or gathers missions in the library.
   var KIND={add_walkways:"ground",remove_walkways:"ground",shape_ground:"ground",remove_ground_area:"ground",sculpt_terrain:"ground",
-    write_texts:"texts",make_versions:"library",make_campaign:"library"};
+    write_texts:"texts",make_versions:"library",make_campaign:"library",run_editor_code:"build",capture_screen:"look"};
   var BY={};T.forEach(function(t){BY[t.name]=t;t.kind=KIND[t.name]||(t.look?"look":t.design?"design":"build")});
   // what an agent may use: a list of kinds, or the old modes ("build" is all)
   function kindsOf(a){return Array.isArray(a)?a:a==="build"?["look","design","build","ground","texts","library"]:["look","design"]}
